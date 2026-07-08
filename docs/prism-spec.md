@@ -579,6 +579,143 @@ Write tests that:
 
 ---
 
+## Planned Enhancements (v0.2)
+
+> Status: **planned, not yet implemented.** These were identified after running Prism against a real
+> project (`vulkan-3d-orbit-viewer-poc`, ~258 translation units). The v0.1 pipeline runs cleanly and
+> produces valid output, but two behaviours make the analysis far less useful on a conventional
+> header/source-split C++ project than on the self-contained `test-input.cpp` fixture. This section is
+> the implementation plan for fixing both. Implement Enhancement B first (it is smaller and Enhancement
+> A depends on the scoping predicate it introduces).
+
+### Motivation (observed on vulkan-3d-orbit-viewer-poc)
+
+- **Header-blindness.** The visitor skips every cursor where `clang_Location_isFromMainFile` is false,
+  and file nodes are only created for translation units (`.cpp`/`.c`). Because C++ declares its classes
+  and APIs in headers, the result was: **0 `File` nodes for any header**, all header-declared classes
+  (`Camera`, `Renderer`, `Swapchain`, `Mesh`, …) **missing**, all 72 method definitions **flattened to
+  the module** (their `logical_parent` fell back to `src` because the owning class was not a node), and
+  the **internal include graph empty** (all 78 `src` include edges pointed at unresolved bare-string
+  header names because headers were not nodes).
+- **Dependency noise.** The compilation database bundles vendored dependencies (SDL3, glm,
+  tinyobjloader). Prism analysed all of them; files outside the project root collapsed to bare
+  filenames, producing **421 duplicate-id warnings** and burying the project's ~171 own nodes among
+  1835 total.
+
+Both behaviours are technically consistent with the v0.1 spec. v0.2 deliberately changes them.
+
+### Enhancement B — Scope extraction to the project root
+
+**Goal.** By default, analyse only files that live under `--project`. Dependency and system code is
+excluded, not flattened.
+
+**New concept — the in-scope predicate.** A file is *in scope* when its real (canonicalised) path is
+lexically under the canonicalised `projectRoot`. Implement one helper in `parser.cpp`:
+
+```cpp
+// true when `absolutePath` is inside `projectRoot`
+bool IsInProjectScope(const std::string& absolutePath, const std::filesystem::path& projectRoot);
+```
+Use `weakly_canonical` on both sides and test that the relative path does not begin with `..`. This is
+the same computation `RelativePath()` already performs; factor the shared logic so both use it.
+
+**Parser changes (`src/parser.cpp`):**
+
+1. **Skip out-of-root translation units.** Before parsing a compile command, resolve its source file to
+   an absolute path and skip the whole TU when it is not in scope — unless `--include-external` is set
+   (see CLI below). Skipped TUs are not counted as parse warnings.
+2. **Replace the main-file filter with the scope filter** in the visitor. The current
+   `clang_Location_isFromMainFile(location)` guard becomes `IsInProjectScope(cursorFilePath, root)`.
+   This is what makes project **headers** contribute declarations while still excluding `<vector>`,
+   SDL, glm, etc. (Enhancement A depends on this.)
+
+**CLI changes (`src/main.cpp`):**
+
+- Add `--include-external` (default off). When set, restore v0.1 behaviour: parse every TU in the
+  database and capture declarations from any file (scope filter disabled). Thread a
+  `bool includeExternal` through `ParserConfig`.
+
+**Expected result.** On vulkan-3d-orbit-viewer-poc the duplicate-id warnings from dependency files
+disappear, and the node set is dominated by the project's own code.
+
+### Enhancement A — Make headers first-class
+
+**Goal.** Capture declarations from project headers, create `File` nodes for headers, connect the
+internal include graph (`.cpp → .h`, `.h → .h`), and re-attach methods to their declaring class.
+
+This depends on Enhancement B: once the visitor captures in-scope (not just main-file) cursors, header
+declarations flow in automatically. The remaining work is **cross-translation-unit de-duplication** and
+**robust parent resolution**, because a header included by *N* translation units will have every one of
+its declarations visited *N* times.
+
+**Data-structure changes:**
+
+- Add two fields to `ASTNode` (`include/prism/ast-node.hpp`):
+  ```
+  std::string usr             // clang_getCursorUSR of this cursor (stable cross-TU identity)
+  std::string semanticParentUsr  // USR of the semantic parent (empty at TU root)
+  ```
+  Adding fields is permitted (v0.1 already added `lineEnd`). Do not remove existing fields.
+
+**Parser changes (`src/parser.cpp`):**
+
+1. Populate `usr` via `clang_getCursorUSR(cursor)` and `semanticParentUsr` from the semantic parent's
+   USR. For `ParentClass` (base specifiers) keep using the traversal `parent` cursor for logical
+   parenting, but record its USR.
+2. **De-duplicate across TUs.** Keep an `unordered_set<std::string>` of USRs already emitted (empty USRs
+   — e.g. inclusion directives — are never deduped by USR). Skip a declaration whose USR was already
+   captured. This collapses the *N* copies of each header declaration to one.
+3. **Include directives.** Capture inclusion directives from in-scope files (not just the main file), so
+   header→header includes are recorded. De-duplicate include ASTNodes by
+   `(includingFileRelPath, includedFileRelPath)`. Store the included file's **project-relative path**
+   (via the existing `RelativePath` helper on `clang_getIncludedFile`), not just its basename, so the
+   graph builder can resolve it to a file node unambiguously. Out-of-scope include targets (system /
+   dependency headers) keep their bare name and remain external.
+
+**Graph-builder changes (`src/graph-builder.cpp`):**
+
+1. **File nodes for headers.** `ensureFileNode()` already creates a file node for any relative path it
+   is given. With header declarations and header→header includes now present, headers naturally become
+   `File` nodes. No structural change needed beyond feeding it header paths.
+2. **Resolve logical parent by USR, not simple name.** Replace the `logicalNameToId` (simple-name) map
+   with a `usrToId` map keyed on `ASTNode.usr`. Resolve a node's `logicalParent` by looking up
+   `semanticParentUsr`. Fall back to the current simple-name behaviour only when USRs are empty. This
+   fixes `Camera::processEvents` re-attaching to `Camera` instead of the module, and correctly handles
+   overloads and same-name-different-namespace collisions.
+3. **Resolve include edges by relative path.** Change the include-target lookup from a basename map to a
+   `relativePathToFileId` map, matching the included file's project-relative path to the file node.
+   Internal includes then produce `.cpp → .h` / `.h → .h` edges; unresolved (external) targets keep the
+   bare-string target as today.
+
+**Metrics.** No new metric code required, but note the downstream wins: `includeDepth` /
+`transitiveIncludeCount` / `compileImpact` become meaningful once the internal include graph connects,
+and `methodCount` / `inheritanceDepth` improve once methods re-attach to their class.
+
+**Node identity note.** Header file node ids follow the existing scheme
+(`Project::module::header.hpp`). Because a header's id is derived from its own path (not the including
+TU), the same header included by many TUs maps to one stable id.
+
+### Testing additions
+
+- **New fixture:** a header declaring a class plus a `.cpp` defining its methods (do not modify the
+  existing `test-input.*`). Add cases verifying:
+  - a `Class` node sourced from the **header** is present;
+  - a header `File` node exists;
+  - a method's `logicalParent` is the class id (not the module id);
+  - an internal `IncludeDependency` edge `source.cpp → header.hpp` exists.
+- **Scope test:** given a compile command whose source lives outside `projectRoot`, its declarations are
+  absent by default and present when `--include-external` is set.
+- Keep all existing v0.1 tests green.
+
+### Out of scope for v0.2
+
+- Function-call / symbol-usage edges (still deferred, see below).
+- Deduplicating *definitions vs declarations* of the same function across a header/source split beyond
+  USR identity (USR de-dup is sufficient; a forward declaration and its definition share a USR and the
+  first-seen wins).
+
+---
+
 ## Deferred / Out of Scope for This Implementation
 
 The following are noted in the design document but are explicitly out of scope for this pass:
