@@ -5,7 +5,6 @@
 #pragma once
 
 #include <firefly/log.hpp>
-#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 #include <memory>
