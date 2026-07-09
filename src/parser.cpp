@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include "firefly/log.hpp"
 
 namespace Prism {
@@ -46,31 +47,45 @@ std::optional<NodeKind> MapCursorKind(CXCursorKind kind)
 
 /// Path of `target` relative to `root`, POSIX separators. Falls back to the
 /// bare filename when the target lives outside the project root.
+std::filesystem::path Canonicalise(const std::filesystem::path& path)
+{
+  std::error_code ec;
+  std::filesystem::path result = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    result = std::filesystem::absolute(path, ec);
+  }
+  return result;
+}
+
 std::string RelativePath(const std::string& target, const std::filesystem::path& root)
 {
   if (target.empty()) {
     return "";
   }
-  std::error_code ec;
-  std::filesystem::path absTarget = std::filesystem::weakly_canonical(target, ec);
-  if (ec) {
-    absTarget = std::filesystem::absolute(target, ec);
-  }
-  std::filesystem::path absRoot = std::filesystem::weakly_canonical(root, ec);
-  if (ec) {
-    absRoot = std::filesystem::absolute(root, ec);
-  }
-  std::filesystem::path relative = absTarget.lexically_relative(absRoot);
+  std::filesystem::path relative = Canonicalise(target).lexically_relative(Canonicalise(root));
   if (relative.empty() || *relative.begin() == "..") {
     return std::filesystem::path(target).filename().generic_string();
   }
   return relative.generic_string();
 }
 
+/// True when `absolutePath` resolves to a location inside `projectRoot`.
+bool IsInProjectScope(const std::string& absolutePath, const std::filesystem::path& projectRoot)
+{
+  if (absolutePath.empty()) {
+    return false;
+  }
+  std::filesystem::path relative =
+      Canonicalise(absolutePath).lexically_relative(Canonicalise(projectRoot));
+  return !relative.empty() && *relative.begin() != "..";
+}
+
 struct VisitContext {
   ParseResult* result;
   std::filesystem::path projectRoot;
   int* idCounter;
+  bool includeExternal;
+  std::unordered_set<std::string>* seen;  // dedup keys across translation units
 };
 
 CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
@@ -78,7 +93,22 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   auto* context = static_cast<VisitContext*>(data);
 
   CXSourceLocation location = clang_getCursorLocation(cursor);
-  if (!clang_Location_isFromMainFile(location)) {
+  CXFile file;
+  unsigned line = 0;
+  unsigned column = 0;
+  unsigned offset = 0;
+  clang_getExpansionLocation(location, &file, &line, &column, &offset);
+  const std::string cursorFile = ToString(clang_getFileName(file));
+
+  // Scope filter: skip cursors (and their subtrees) that live outside the
+  // project root, unless external analysis was explicitly requested. This is
+  // what lets project *headers* contribute declarations while excluding system
+  // and dependency headers. Cursors with no file (compiler builtins) are always
+  // skipped.
+  if (cursorFile.empty()) {
+    return CXChildVisit_Continue;
+  }
+  if (!context->includeExternal && !IsInProjectScope(cursorFile, context->projectRoot)) {
     return CXChildVisit_Continue;
   }
 
@@ -87,17 +117,22 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
     return CXChildVisit_Recurse;
   }
 
+  // Skip forward declarations of records (`class Foo;`). A forward declaration
+  // and the real definition share a USR, and the first seen wins the dedup — so
+  // without this a class node could point at a bodyless declaration in an
+  // unrelated header, losing its extent, fields, and methods.
+  if ((mappedKind.value() == NodeKind::Class || mappedKind.value() == NodeKind::Struct) &&
+      clang_isCursorDefinition(cursor) == 0) {
+    return CXChildVisit_Recurse;
+  }
+
   ASTNode node;
   node.id = (*context->idCounter)++;
   node.kind = mappedKind.value();
   node.name = ToString(clang_getCursorSpelling(cursor));
   node.type = ToString(clang_getTypeSpelling(clang_getCursorType(cursor)));
+  node.usr = ToString(clang_getCursorUSR(cursor));
 
-  CXFile file;
-  unsigned line = 0;
-  unsigned column = 0;
-  unsigned offset = 0;
-  clang_getExpansionLocation(location, &file, &line, &column, &offset);
   node.line = static_cast<int>(line);
   node.column = static_cast<int>(column);
 
@@ -110,17 +145,19 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   clang_getExpansionLocation(endLocation, nullptr, &endLine, &endColumn, &endOffset);
   node.lineEnd = (endLine >= line) ? static_cast<int>(endLine) : static_cast<int>(line);
 
-  node.file = RelativePath(ToString(clang_getFileName(file)), context->projectRoot);
+  node.file = RelativePath(cursorFile, context->projectRoot);
   node.physicalParent = std::filesystem::path(node.file).parent_path().generic_string();
 
-  // Logical parent: the semantic parent's simple name, or empty at TU root.
-  // Base specifiers report the translation unit as their semantic parent, so
-  // use the traversal parent (the derived class) passed by clang_visitChildren.
+  // Logical parent: the semantic parent, recorded by both simple name (fallback)
+  // and USR (primary, robust across translation units). Base specifiers report
+  // the translation unit as their semantic parent, so use the traversal parent
+  // (the derived class) passed by clang_visitChildren instead.
   CXCursor logicalParentCursor =
       (node.kind == NodeKind::ParentClass) ? parent : clang_getCursorSemanticParent(cursor);
   if (!clang_Cursor_isNull(logicalParentCursor) &&
       clang_getCursorKind(logicalParentCursor) != CXCursor_TranslationUnit) {
     node.logicalParent = ToString(clang_getCursorSpelling(logicalParentCursor));
+    node.semanticParentUsr = ToString(clang_getCursorUSR(logicalParentCursor));
   }
 
   // Referenced name for relationship-bearing kinds.
@@ -128,7 +165,9 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
     case NodeKind::Include: {
       CXFile included = clang_getIncludedFile(cursor);
       const std::string includedPath = ToString(clang_getFileName(included));
-      node.referencedName = std::filesystem::path(includedPath).filename().generic_string();
+      // Project-relative path for in-scope headers (so the graph builder can
+      // resolve the include to a file node), bare filename for external ones.
+      node.referencedName = RelativePath(includedPath, context->projectRoot);
       if (node.referencedName.empty()) {
         node.referencedName = node.name;
       }
@@ -151,6 +190,27 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
       break;
     default:
       break;
+  }
+
+  // Cross-translation-unit de-duplication. A header declaration is visited once
+  // per TU that includes it; keep only the first occurrence. USR is the stable
+  // identity where clang provides one; includes and base specifiers have none,
+  // so key those on their file/relationship instead.
+  std::string dedupKey;
+  if (!node.usr.empty()) {
+    dedupKey = "usr|" + node.usr;
+  }
+  else if (node.kind == NodeKind::Include) {
+    dedupKey = "inc|" + node.file + "|" + node.referencedName;
+  }
+  else if (node.kind == NodeKind::ParentClass) {
+    dedupKey = "base|" + node.semanticParentUsr + "|" + node.referencedName;
+  }
+  else {
+    dedupKey = "loc|" + node.file + "|" + std::to_string(node.line) + "|" + node.name;
+  }
+  if (!context->seen->insert(dedupKey).second) {
+    return CXChildVisit_Recurse;  // already captured in another TU
   }
 
   context->result->nodes.push_back(std::move(node));
@@ -229,6 +289,7 @@ ParseResult Parser::Parse()
   CXCompileCommands commands = clang_CompilationDatabase_getAllCompileCommands(database);
   const unsigned commandCount = clang_CompileCommands_getSize(commands);
   int idCounter = 0;
+  std::unordered_set<std::string> seen;  // cross-TU de-duplication keys
 
   for (unsigned commandIndex = 0; commandIndex < commandCount; ++commandIndex) {
     CXCompileCommand command = clang_CompileCommands_getCommand(commands, commandIndex);
@@ -240,6 +301,13 @@ ParseResult Parser::Parse()
       sourcePath = std::filesystem::path(directory) / sourcePath;
     }
     const std::string sourceFile = sourcePath.lexically_normal().string();
+
+    // Skip translation units whose source lives outside the project root. Their
+    // in-scope project headers are still reached through the TUs that live
+    // inside the root and include them.
+    if (!config_.includeExternal && !IsInProjectScope(sourceFile, config_.projectRoot)) {
+      continue;
+    }
 
     if (config_.verbose) {
       LOG_INFO("Parsing translation unit [{}]", sourceFile);
@@ -285,7 +353,7 @@ ParseResult Parser::Parse()
     }
 
     CXCursor rootCursor = clang_getTranslationUnitCursor(unit);
-    VisitContext context{&result, config_.projectRoot, &idCounter};
+    VisitContext context{&result, config_.projectRoot, &idCounter, config_.includeExternal, &seen};
     clang_visitChildren(rootCursor, Visitor, &context);
 
     clang_disposeTranslationUnit(unit);

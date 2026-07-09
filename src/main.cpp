@@ -18,12 +18,14 @@ struct CliOptions {
   std::filesystem::path outputPath = "./analysis.json";
   std::filesystem::path compileCommandsPath;
   bool verbose = false;
+  bool includeExternal = false;
 };
 
 void PrintUsage(const char* program)
 {
   std::cerr << "Usage: " << program
-            << " --project <path> [--output <path>] [--compile-commands <path>] [--verbose]\n";
+            << " --project <path> [--output <path>] [--compile-commands <path>] [--verbose] "
+               "[--include-external]\n";
 }
 
 }  // namespace
@@ -55,6 +57,9 @@ int main(int argc, char** argv)
     }
     else if (argument == "--verbose") {
       options.verbose = true;
+    }
+    else if (argument == "--include-external") {
+      options.includeExternal = true;
     }
     else if (argument == "--help" || argument == "-h") {
       PrintUsage(argv[0]);
@@ -108,6 +113,7 @@ int main(int argc, char** argv)
   parserConfig.projectRoot = options.projectRoot;
   parserConfig.compileCommandsPath = options.compileCommandsPath;
   parserConfig.verbose = options.verbose;
+  parserConfig.includeExternal = options.includeExternal;
 
   Prism::Parser parser(parserConfig);
   Prism::ParseResult parseResult = parser.Parse();

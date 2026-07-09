@@ -58,7 +58,15 @@ If `--compile-commands` is omitted, Prism looks for
 | `--output <path>` | no | `./analysis.json` | Where to write the analysis. |
 | `--compile-commands <path>` | no | `<project>/compile_commands.json` | Path to the compilation database (file or its directory). |
 | `--verbose` | no | off | Print per-stage progress and diagnostics. |
+| `--include-external` | no | off | Analyse every translation unit in the database, including files outside `--project` (dependencies, system headers). Off by default. |
 | `--help`, `-h` | no | — | Print usage and exit. |
+
+> **Point `--project` at your source directory.** By default Prism only analyses
+> files under `--project`; anything outside is skipped. Because dependencies are
+> often vendored *inside* the repo (e.g. CMake FetchContent under `build/_deps/`),
+> pointing `--project` at the repository root pulls those in too. Point it at the
+> source tree (e.g. `<repo>/src`) to get a clean, project-only graph, or pass
+> `--include-external` to deliberately analyse everything.
 
 Prism exits `0` on success and `1` on a pipeline failure (bad arguments, missing
 project directory, unreadable compilation database, or an export failure).

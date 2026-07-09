@@ -66,6 +66,8 @@ struct ASTNode {
   std::string physicalParent;
   std::string logicalParent;
   std::string referencedName;
+  std::string usr;                // clang USR: stable identity across translation units
+  std::string semanticParentUsr;  // USR of the semantic parent (empty at TU root)
 };
 
 }  // namespace Prism

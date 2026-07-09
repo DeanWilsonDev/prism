@@ -57,10 +57,12 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
 
   std::unordered_set<std::string> physicalCreated{projectName_};
   std::unordered_set<std::string> declaredIds{projectName_};
-  // Simple name -> logical id, so a child can find its semantic parent.
+  // USR -> node id: the primary, cross-TU-stable way to resolve a logical parent.
+  std::unordered_map<std::string, std::string> usrToId;
+  // Simple name -> logical id: fallback parent resolution when USRs are absent.
   std::unordered_map<std::string, std::string> logicalNameToId;
-  // Filename (basename) -> file node id, for resolving include targets.
-  std::unordered_map<std::string, std::string> filenameToFileId;
+  // Project-relative path -> file node id, for resolving include targets.
+  std::unordered_map<std::string, std::string> relativePathToFileId;
   // Class/struct simple name -> node id, for inheritance / composition targets.
   std::unordered_map<std::string, std::string> typeNameToId;
 
@@ -98,7 +100,9 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
       file.logicalParent = moduleId;
       file.file = parts.filename;
       graph.AddNode(std::move(file));
-      filenameToFileId.emplace(parts.filename, fileId);
+    }
+    if (!parts.filename.empty()) {
+      relativePathToFileId[relativePath] = fileId;
     }
     return {fileId, moduleId};
   };
@@ -132,13 +136,26 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
   for (const ASTNode& node : astNodes) {
     const auto [fileId, moduleId] = ensureFileNode(node.file);
 
-    // Resolve the logical parent id.
+    // Resolve the logical parent id: prefer the semantic parent's USR (stable
+    // across translation units, so a method in a .cpp re-attaches to the class
+    // declared in its .h), and fall back to matching the parent's simple name.
     std::string logicalParentId = moduleId;
-    if (!node.logicalParent.empty()) {
-      auto it = logicalNameToId.find(node.logicalParent);
-      if (it != logicalNameToId.end()) {
-        logicalParentId = it->second;
-      }
+    if (auto usrIt = usrToId.find(node.semanticParentUsr);
+        !node.semanticParentUsr.empty() && usrIt != usrToId.end()) {
+      logicalParentId = usrIt->second;
+    }
+    else if (
+        auto nameIt = logicalNameToId.find(node.logicalParent);
+        !node.logicalParent.empty() && nameIt != logicalNameToId.end()
+    ) {
+      logicalParentId = nameIt->second;
+    }
+
+    // Include directives belong to the file they appear in: scope them to the
+    // file node so the same header included by many files yields distinct,
+    // non-colliding node ids (e.g. src::renderer.h::vector, not src::vector).
+    if (node.kind == NodeKind::Include) {
+      logicalParentId = fileId;
     }
 
     GraphNode graphNode;
@@ -155,6 +172,9 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
     std::string baseId = logicalParentId + "::" + (node.name.empty() ? "anonymous" : node.name);
     graphNode.id = uniqueId(baseId);
 
+    if (!node.usr.empty()) {
+      usrToId.emplace(node.usr, graphNode.id);
+    }
     if (IsLogicalContainer(node.kind)) {
       logicalNameToId[node.name] = graphNode.id;
     }
@@ -196,13 +216,13 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
     }
   };
 
-  // Include edges: file -> included file (a project file when known).
+  // Include edges: file -> included file. When the include target is a project
+  // file that became a node (matched by its project-relative path), the edge
+  // connects two file nodes; otherwise the target stays as the external name.
   for (const PendingEdge& pending : includeEdges) {
-    const std::string includedName =
-        std::filesystem::path(pending.source.referencedName).filename().string();
     std::string target = pending.source.referencedName;
-    auto it = filenameToFileId.find(includedName);
-    if (it != filenameToFileId.end()) {
+    auto it = relativePathToFileId.find(pending.source.referencedName);
+    if (it != relativePathToFileId.end()) {
       target = it->second;
     }
     addEdge(pending.fileId, target, EdgeKind::IncludeDependency);

@@ -165,3 +165,50 @@ cmake --build build
 
 The committed `CMakeLists.txt` keeps the Linux defaults; the macOS paths are
 supplied at configure time rather than hard-coded.
+
+---
+
+## 9. v0.2 — header-aware extraction and project-root scoping
+
+Full plan and per-file design in `docs/prism-spec.md` ("Planned Enhancements
+(v0.2)"). Motivated by running v0.1 against `vulkan-3d-orbit-viewer-poc`, where
+header-declared classes were missing, methods flattened to the module, and the
+internal include graph was empty. Key decisions:
+
+- **Project-root scoping (default on).** Only files under `--project` are
+  analysed; the visitor's main-file filter became an in-scope-of-project filter,
+  and out-of-root translation units are skipped entirely. `--include-external`
+  restores whole-database analysis. This is what lets project *headers*
+  contribute declarations while excluding system/dependency headers.
+- **USR-based identity.** `ASTNode` gained `usr` / `semanticParentUsr`. The
+  parser de-duplicates declarations across translation units by USR (a header
+  declaration is otherwise visited once per including TU), and the graph builder
+  resolves logical parents by the parent's USR (falling back to simple-name).
+  This re-attaches out-of-line methods (`Camera::update`) to the class declared
+  in the header instead of the module.
+- **Include edges resolve by project-relative path**, not basename, so
+  `.cpp → .h` and `.h → .h` connect unambiguously; external headers keep a bare
+  target string.
+
+Refinements found during implementation (also recorded in the spec's as-built
+notes):
+
+- **Skip record forward declarations.** `class Foo;` and the definition share a
+  USR; first-seen won, so a class node could point at a bodyless forward
+  declaration (observed: `Camera` in `renderer.h`). The parser now skips
+  `ClassDecl`/`StructDecl` cursors that are not definitions, so the definition
+  wins and carries the real extent, fields, and methods.
+- **Include nodes are file-scoped.** Their ids are built from the including file
+  node (`…::renderer.h::vector`), not the module, so the same header included by
+  many files no longer collides.
+- **Vendored deps sit inside the repo.** FetchContent places dependencies under
+  `build/_deps/`, which is *inside* the project root, so root-scoping alone does
+  not exclude them. Guidance: point `--project` at the source directory
+  (`<repo>/src`). On the test project this took the graph from 1835 nodes (deps
+  included) to 359 project-only nodes, and duplicate-id warnings from 421 to 2
+  (both genuine member overloads). A built-in build-directory exclusion was
+  considered but deliberately not added, to avoid baking in a heuristic.
+
+**Result on `vulkan-3d-orbit-viewer-poc/src`:** 15 classes/structs captured
+(were ~1), methods re-attached (e.g. `VulkanContext` = 23), 32 internal include
+edges (were 0), and `lines_of_code` populated for every class.

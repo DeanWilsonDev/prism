@@ -17,6 +17,10 @@ struct ParserConfig {
   std::filesystem::path projectRoot;
   std::filesystem::path compileCommandsPath;
   bool verbose = false;
+  // When false (default), only files under projectRoot are analysed. When true,
+  // every translation unit in the database is parsed and declarations from any
+  // file (including dependencies and system headers) are captured.
+  bool includeExternal = false;
 };
 
 /// Stage 1. Loads a compilation database, parses every translation unit with

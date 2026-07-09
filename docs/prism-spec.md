@@ -581,12 +581,12 @@ Write tests that:
 
 ## Planned Enhancements (v0.2)
 
-> Status: **planned, not yet implemented.** These were identified after running Prism against a real
-> project (`vulkan-3d-orbit-viewer-poc`, ~258 translation units). The v0.1 pipeline runs cleanly and
-> produces valid output, but two behaviours make the analysis far less useful on a conventional
-> header/source-split C++ project than on the self-contained `test-input.cpp` fixture. This section is
-> the implementation plan for fixing both. Implement Enhancement B first (it is smaller and Enhancement
-> A depends on the scoping predicate it introduces).
+> Status: **implemented.** These were identified after running Prism against a real project
+> (`vulkan-3d-orbit-viewer-poc`, ~258 translation units). The v0.1 pipeline ran cleanly and produced
+> valid output, but two behaviours made the analysis far less useful on a conventional
+> header/source-split C++ project than on the self-contained `test-input.cpp` fixture. Both are now
+> implemented; see the **As-built notes** at the end of this section for refinements discovered during
+> implementation, and `docs/decisions.md` for outcomes.
 
 ### Motivation (observed on vulkan-3d-orbit-viewer-poc)
 
@@ -711,8 +711,35 @@ TU), the same header included by many TUs maps to one stable id.
 
 - Function-call / symbol-usage edges (still deferred, see below).
 - Deduplicating *definitions vs declarations* of the same function across a header/source split beyond
-  USR identity (USR de-dup is sufficient; a forward declaration and its definition share a USR and the
-  first-seen wins).
+  USR identity (USR de-dup is sufficient; the first-seen wins). See the record-forward-declaration
+  refinement below for the one case where this mattered in practice.
+
+### As-built notes (refinements found during implementation)
+
+Three refinements beyond the plan above were needed once the changes were tested against
+`vulkan-3d-orbit-viewer-poc`:
+
+1. **Skip record forward declarations.** A `class Foo;` forward declaration and the real definition
+   share a USR, so first-seen won the dedup — and a class node could end up pointing at a bodyless
+   forward declaration in an unrelated header (observed: `Camera`, forward-declared in `renderer.h`,
+   defined in `camera.h`), losing its extent, fields, and methods. Fix: in the parser, skip
+   `ClassDecl`/`StructDecl` cursors where `clang_isCursorDefinition` is false, so the definition always
+   wins. (Records only — function prototypes are still captured when no in-scope definition exists.)
+
+2. **Scope Include nodes to their including file.** Once includes are captured from headers too, every
+   file that `#include`s a common header (`<vector>`, `vulkan/vulkan.h`, …) produced an Include *node*
+   whose id was module-scoped by the included name, so they all collided and triggered hundreds of
+   disambiguation warnings. Fix: the graph builder sets an Include node's logical parent to its file
+   node, so its id is `Project::…::including-file::included-name` — unique per (file, include). Include
+   *edges* were already de-duplicated by `(includingFile, includedFile)` and were unaffected.
+
+3. **Vendored dependencies live *inside* the repo.** Project-root scoping (Enhancement B) excludes code
+   outside `--project`, but dependencies fetched under `build/_deps/` (FetchContent) sit *inside* the
+   repo root and are therefore still in scope. The practical guidance is to point `--project` at the
+   source directory (e.g. `<repo>/src`) rather than the repo root; doing so on the test project reduced
+   the graph from 1835 nodes (deps included) to 359 project-only nodes with 2 legitimate duplicate-id
+   warnings (both real member overloads). A built-in build-directory exclusion was considered but left
+   out to avoid baking in a heuristic; revisit if this proves a common pain point.
 
 ---
 

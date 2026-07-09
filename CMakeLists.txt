@@ -83,7 +83,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE ${PROJECT_NAME}-core)
 add_executable(
   ${PROJECT_NAME}-tests
   test/test-main.cpp test/exporter.test.cpp test/graph-builder.test.cpp
-  test/parser.test.cpp test/metrics-engine.test.cpp)
+  test/parser.test.cpp test/metrics-engine.test.cpp
+  test/header-extraction.test.cpp)
 
 target_include_directories(${PROJECT_NAME}-tests PRIVATE include)
 
