@@ -264,6 +264,12 @@ Every node carries `id`, `name`, `type`, `physical_parent`, `logical_parent`,
 `dependency_count`, `coupling_score`, `instability`, `circular_dependency`,
 `include_depth`, …) appear only when they were computed for that node.
 
+**Lines of code.** `File` nodes report their exact physical line count.
+Functions and types report the span of their *definition* (a method defined in a
+`.cpp` reports its body, not the header signature). `Module` and `Project` nodes
+aggregate the line counts of the files beneath them, and `Namespace` nodes
+aggregate the classes and functions declared directly in them.
+
 ______________________________________________________________________
 
 ## Tech stack

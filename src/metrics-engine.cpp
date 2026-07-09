@@ -178,16 +178,98 @@ void MetricsEngine::ComputeCodeMetrics(DependencyGraph& graph)
       node.inheritanceDepth = inheritanceDepth(node.id, visiting);
     }
 
-    // linesOfCode is the inclusive span of the node's source extent (captured
-    // by the parser as start line .. lineEnd). Left as std::nullopt for nodes
-    // without a real multi-line span (e.g. synthesised project/module/file
-    // nodes, or single-token declarations where lineEnd == line).
-    if (node.lineEnd > node.line) {
+    // Leaf lines of code: the inclusive span of the declaration's source extent.
+    // Containers (file/module/namespace/project) are aggregated separately;
+    // file nodes already carry their physical line count from the graph builder.
+    const bool isLeaf = node.kind == NodeKind::Function || node.kind == NodeKind::Class ||
+                        node.kind == NodeKind::Struct || node.kind == NodeKind::Field;
+    if (isLeaf && node.lineEnd > node.line) {
       node.linesOfCode = node.lineEnd - node.line + 1;
     }
 
     // TODO: publicMethodCount needs visibility (public/private) tracking, which
     // ASTNode does not currently carry. Left as std::nullopt.
+  }
+
+  AggregateLinesOfCode(graph);
+}
+
+void MetricsEngine::AggregateLinesOfCode(DependencyGraph& graph)
+{
+  // Container LOC is the sum of its children's LOC: modules and the project sum
+  // their physical children (sub-modules + files), namespaces sum their logical
+  // children (nested namespaces + classes/structs/free functions). Methods are
+  // logical children of their class, not the namespace, so they are not double
+  // counted. Leaf LOC and file LOC must already be assigned before this runs.
+  std::unordered_map<std::string, GraphNode*> byId;
+  std::unordered_map<std::string, std::vector<std::string>> physicalChildren;
+  std::unordered_map<std::string, std::vector<std::string>> logicalChildren;
+  for (GraphNode& node : graph.nodes) {
+    byId[node.id] = &node;
+    if (!node.physicalParent.empty()) {
+      physicalChildren[node.physicalParent].push_back(node.id);
+    }
+    if (!node.logicalParent.empty()) {
+      logicalChildren[node.logicalParent].push_back(node.id);
+    }
+  }
+
+  std::unordered_map<std::string, std::optional<int>> physicalMemo;
+  std::unordered_map<std::string, std::optional<int>> logicalMemo;
+
+  std::function<std::optional<int>(const std::string&)> aggregatePhysical =
+      [&](const std::string& id) -> std::optional<int> {
+    if (auto cached = physicalMemo.find(id); cached != physicalMemo.end()) {
+      return cached->second;
+    }
+    physicalMemo[id] = std::nullopt;  // guard against cycles
+    GraphNode* node = byId[id];
+    std::optional<int> total;
+    for (const std::string& childId : physicalChildren[id]) {
+      GraphNode* child = byId[childId];
+      std::optional<int> childLoc =
+          (child->kind == NodeKind::Module) ? aggregatePhysical(childId) : child->linesOfCode;
+      if (childLoc.has_value()) {
+        total = total.value_or(0) + childLoc.value();
+      }
+    }
+    if ((node->kind == NodeKind::Module || node->kind == NodeKind::Project) && total.has_value()) {
+      node->linesOfCode = total;
+    }
+    physicalMemo[id] = total;
+    return total;
+  };
+
+  std::function<std::optional<int>(const std::string&)> aggregateLogical =
+      [&](const std::string& id) -> std::optional<int> {
+    if (auto cached = logicalMemo.find(id); cached != logicalMemo.end()) {
+      return cached->second;
+    }
+    logicalMemo[id] = std::nullopt;
+    GraphNode* node = byId[id];
+    std::optional<int> total;
+    for (const std::string& childId : logicalChildren[id]) {
+      GraphNode* child = byId[childId];
+      std::optional<int> childLoc =
+          (child->kind == NodeKind::Namespace) ? aggregateLogical(childId) : child->linesOfCode;
+      if (childLoc.has_value()) {
+        total = total.value_or(0) + childLoc.value();
+      }
+    }
+    if (node->kind == NodeKind::Namespace && total.has_value()) {
+      node->linesOfCode = total;
+    }
+    logicalMemo[id] = total;
+    return total;
+  };
+
+  for (GraphNode& node : graph.nodes) {
+    if (node.kind == NodeKind::Module || node.kind == NodeKind::Project) {
+      aggregatePhysical(node.id);
+    }
+    else if (node.kind == NodeKind::Namespace) {
+      aggregateLogical(node.id);
+    }
   }
 }
 

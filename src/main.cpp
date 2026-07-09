@@ -140,7 +140,7 @@ int main(int argc, char** argv)
 
   // Stage 2 — build the dependency graph.
   Prism::GraphBuilder builder(projectName);
-  Prism::DependencyGraph graph = builder.Build(parseResult.nodes);
+  Prism::DependencyGraph graph = builder.Build(parseResult.nodes, parseResult.fileLineCounts);
   if (options.verbose) {
     LOG_INFO("Built graph with {} nodes and {} edges", graph.nodes.size(), graph.edges.size());
   }

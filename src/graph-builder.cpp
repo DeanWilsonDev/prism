@@ -42,7 +42,9 @@ bool IsLogicalContainer(NodeKind kind)
 
 GraphBuilder::GraphBuilder(std::string projectName) : projectName_(std::move(projectName)) {}
 
-DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
+DependencyGraph GraphBuilder::Build(
+    const std::vector<ASTNode>& astNodes, const std::unordered_map<std::string, int>& fileLineCounts
+)
 {
   DependencyGraph graph;
 
@@ -99,6 +101,10 @@ DependencyGraph GraphBuilder::Build(const std::vector<ASTNode>& astNodes)
       file.physicalParent = moduleId;
       file.logicalParent = moduleId;
       file.file = parts.filename;
+      if (auto lines = fileLineCounts.find(relativePath);
+          lines != fileLineCounts.end() && lines->second > 0) {
+        file.linesOfCode = lines->second;
+      }
       graph.AddNode(std::move(file));
     }
     if (!parts.filename.empty()) {

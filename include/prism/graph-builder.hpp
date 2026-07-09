@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "ast-node.hpp"
 #include "dependency-graph.hpp"
@@ -19,7 +20,14 @@ namespace Prism {
 class GraphBuilder {
  public:
   explicit GraphBuilder(std::string projectName);
-  DependencyGraph Build(const std::vector<ASTNode>& astNodes);
+
+  /// Build the graph. `fileLineCounts` maps a project-relative file path to its
+  /// physical line count; when supplied, file nodes are given that line count as
+  /// their linesOfCode (used to aggregate module/project LOC downstream).
+  DependencyGraph Build(
+      const std::vector<ASTNode>& astNodes,
+      const std::unordered_map<std::string, int>& fileLineCounts = {}
+  );
 
  private:
   std::string projectName_;

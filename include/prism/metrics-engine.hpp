@@ -15,6 +15,8 @@ class MetricsEngine {
   void ComputeStructuralMetrics(DependencyGraph& graph);
   void ComputeCodeMetrics(DependencyGraph& graph);
   void ComputeCppMetrics(DependencyGraph& graph);
+  // Roll leaf/file LOC up into container nodes (module, project, namespace).
+  void AggregateLinesOfCode(DependencyGraph& graph);
 };
 
 }  // namespace Prism

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "ast-node.hpp"
 
@@ -11,6 +12,8 @@ struct ParseResult {
   std::vector<ASTNode> nodes;
   std::vector<std::string> warnings;
   bool hadErrors = false;
+  // Project-relative file path -> physical line count, for file/module LOC.
+  std::unordered_map<std::string, int> fileLineCounts;
 };
 
 struct ParserConfig {

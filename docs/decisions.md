@@ -220,3 +220,44 @@ notes):
 **Result on `vulkan-3d-orbit-viewer-poc/src`:** 15 classes/structs captured
 (were ~1), methods re-attached (e.g. `VulkanContext` = 23), 32 internal include
 edges (were 0), and `lines_of_code` populated for every class.
+
+---
+
+## 10. Lines of code: real bodies and container aggregation
+
+Motivated by testing against `snake`, where module nodes reported no LOC,
+namespaces showed a single lexical block, and most functions reported nothing —
+because a header *declaration* (a one-line signature) won the USR dedup over the
+`.cpp` *definition* that has the body.
+
+- **Prefer definitions over declarations.** The parser now keeps one node per
+  USR but lets the definition win: when a definition arrives after a declaration
+  was captured, it upgrades the stored node's source span (line/lineEnd) and
+  file. So a method declared in a header and defined in a `.cpp` reports the
+  body's line count and is located at the definition. This generalises — and
+  replaces — the earlier "skip record forward declarations" special case.
+- **Exact file line counts.** The parser reads each in-scope file once and
+  records its physical line count (`ParseResult::fileLineCounts`); the graph
+  builder stamps that onto `File` nodes as `linesOfCode`. File LOC matches
+  `wc -l` exactly.
+- **Container aggregation** (metrics engine, `AggregateLinesOfCode`): modules and
+  the project sum their **physical** children (sub-modules + files); namespaces
+  sum their **logical** children (nested namespaces + classes/structs/free
+  functions). Methods are logical children of their class, not the namespace, so
+  they are not double counted. Leaf declarations keep their own source-extent
+  LOC. Aggregation is memoised and cycle-guarded, and leaves a container as
+  `std::nullopt` when nothing underneath it had a line count (never a `0`
+  sentinel).
+
+**Result on `snake`:** file LOC is exact (`entity.cpp` = 99, `size-2d.hpp` = 38),
+module `engine` = 2115, namespace `Engine` = 461 (was 30), and the project totals
+6313 lines — vs 6626 for a raw `wc -l` of `src`, the difference being header
+files that contribute no captured cursors (e.g. pure forward-declaration or
+macro-only headers) and so never become file nodes.
+
+**Known limitation.** A namespace re-opened across several modules produces one
+node per module (its id embeds the module of first capture), so a namespace's
+aggregate reflects only the members whose logical parent is that particular node,
+not every block of that namespace across the whole project. Physical
+module/project aggregation is unaffected and is the reliable "all the lines under
+here" number.

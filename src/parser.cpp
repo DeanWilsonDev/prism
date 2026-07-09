@@ -5,9 +5,12 @@
 #include <clang-c/Index.h>
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include "firefly/log.hpp"
 
@@ -138,9 +141,37 @@ struct VisitContext {
   std::filesystem::path projectRoot;
   int* idCounter;
   bool includeExternal;
-  std::unordered_set<std::string>* seen;            // dedup keys across translation units
-  const std::unordered_set<std::string>* excluded;  // excluded directory names
+  std::unordered_set<std::string>* seen;                     // dedup keys for USR-less nodes
+  const std::unordered_set<std::string>* excluded;           // excluded directory names
+  std::unordered_map<std::string, std::size_t>* usrToIndex;  // USR -> index in result->nodes
+  std::unordered_set<std::string>* definedUsrs;              // USRs captured from a definition
 };
+
+/// Physical line count of a text file (number of lines, counting a final line
+/// without a trailing newline). 0 when the file cannot be read.
+int CountFileLines(const std::string& path)
+{
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return 0;
+  }
+  int lines = 0;
+  bool sawContentOnLine = false;
+  char character = 0;
+  while (input.get(character)) {
+    if (character == '\n') {
+      ++lines;
+      sawContentOnLine = false;
+    }
+    else {
+      sawContentOnLine = true;
+    }
+  }
+  if (sawContentOnLine) {
+    ++lines;  // trailing line with no newline
+  }
+  return lines;
+}
 
 CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
 {
@@ -172,15 +203,6 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
     return CXChildVisit_Recurse;
   }
 
-  // Skip forward declarations of records (`class Foo;`). A forward declaration
-  // and the real definition share a USR, and the first seen wins the dedup — so
-  // without this a class node could point at a bodyless declaration in an
-  // unrelated header, losing its extent, fields, and methods.
-  if ((mappedKind.value() == NodeKind::Class || mappedKind.value() == NodeKind::Struct) &&
-      clang_isCursorDefinition(cursor) == 0) {
-    return CXChildVisit_Recurse;
-  }
-
   ASTNode node;
   node.id = (*context->idCounter)++;
   node.kind = mappedKind.value();
@@ -202,6 +224,13 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
 
   node.file = RelativePath(cursorFile, context->projectRoot);
   node.physicalParent = std::filesystem::path(node.file).parent_path().generic_string();
+
+  // Record the file's physical line count once, so file/module LOC can be
+  // aggregated later. Keyed by the project-relative path used for file nodes.
+  if (!node.file.empty() &&
+      context->result->fileLineCounts.find(node.file) == context->result->fileLineCounts.end()) {
+    context->result->fileLineCounts.emplace(node.file, CountFileLines(cursorFile));
+  }
 
   // Logical parent: the semantic parent, recorded by both simple name (fallback)
   // and USR (primary, robust across translation units). Base specifiers report
@@ -248,14 +277,39 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   }
 
   // Cross-translation-unit de-duplication. A header declaration is visited once
-  // per TU that includes it; keep only the first occurrence. USR is the stable
-  // identity where clang provides one; includes and base specifiers have none,
-  // so key those on their file/relationship instead.
-  std::string dedupKey;
+  // per TU that includes it, and a function/record is often declared in a header
+  // and defined in a .cpp — both share a USR. Keep one node per USR, but let the
+  // *definition* win: when the definition arrives after a declaration was
+  // captured, upgrade the stored node's source span (so its lines of code
+  // reflect the body, not the signature) and its file.
+  const bool isDefinition = clang_isCursorDefinition(cursor) != 0;
   if (!node.usr.empty()) {
-    dedupKey = "usr|" + node.usr;
+    auto existing = context->usrToIndex->find(node.usr);
+    if (existing != context->usrToIndex->end()) {
+      if (isDefinition && context->definedUsrs->insert(node.usr).second) {
+        ASTNode& stored = context->result->nodes[existing->second];
+        stored.line = node.line;
+        stored.column = node.column;
+        stored.lineEnd = node.lineEnd;
+        stored.file = node.file;
+        stored.physicalParent = node.physicalParent;
+        stored.type = node.type;
+      }
+      return CXChildVisit_Recurse;  // already captured in another TU
+    }
+    const std::string usr = node.usr;
+    const std::size_t index = context->result->nodes.size();
+    if (isDefinition) {
+      context->definedUsrs->insert(usr);
+    }
+    context->result->nodes.push_back(std::move(node));
+    context->usrToIndex->emplace(usr, index);
+    return CXChildVisit_Recurse;
   }
-  else if (node.kind == NodeKind::Include) {
+
+  // USR-less nodes (includes, base specifiers): key on their file / relationship.
+  std::string dedupKey;
+  if (node.kind == NodeKind::Include) {
     dedupKey = "inc|" + node.file + "|" + node.referencedName;
   }
   else if (node.kind == NodeKind::ParentClass) {
@@ -354,7 +408,9 @@ ParseResult Parser::Parse()
   CXCompileCommands commands = clang_CompilationDatabase_getAllCompileCommands(database);
   const unsigned commandCount = clang_CompileCommands_getSize(commands);
   int idCounter = 0;
-  std::unordered_set<std::string> seen;  // cross-TU de-duplication keys
+  std::unordered_set<std::string> seen;  // cross-TU dedup keys for USR-less nodes
+  std::unordered_map<std::string, std::size_t> usrToIndex;
+  std::unordered_set<std::string> definedUsrs;
 
   for (unsigned commandIndex = 0; commandIndex < commandCount; ++commandIndex) {
     CXCompileCommand command = clang_CompileCommands_getCommand(commands, commandIndex);
@@ -419,7 +475,14 @@ ParseResult Parser::Parse()
 
     CXCursor rootCursor = clang_getTranslationUnitCursor(unit);
     VisitContext context{
-        &result, config_.projectRoot, &idCounter, config_.includeExternal, &seen, &excluded
+        &result,
+        config_.projectRoot,
+        &idCounter,
+        config_.includeExternal,
+        &seen,
+        &excluded,
+        &usrToIndex,
+        &definedUsrs
     };
     clang_visitChildren(rootCursor, Visitor, &context);
 

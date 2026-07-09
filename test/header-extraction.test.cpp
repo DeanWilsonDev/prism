@@ -5,6 +5,7 @@
 #include <string>
 #include "prism/graph-builder.hpp"
 #include "prism/logging/log.hpp"
+#include "prism/metrics-engine.hpp"
 #include "prism/parser.hpp"
 
 #ifndef PRISM_TEST_EXAMPLE_DIR
@@ -59,12 +60,16 @@ Prism::ParseResult ParseOrbitExcludingExample(bool excludeExample)
   return Prism::Parser(config).Parse();
 }
 
-// Full parse + build against the orbit fixture, scoped to src/example.
+// Full pipeline (parse -> build -> metrics) against the orbit fixture, scoped to
+// src/example, so LOC aggregation and file line counts are exercised too.
 const Prism::DependencyGraph& SharedGraph()
 {
   static const Prism::DependencyGraph graph = []() {
     Prism::ParseResult result = ParseOrbit(false, PRISM_TEST_EXAMPLE_DIR);
-    return Prism::GraphBuilder("Demo").Build(result.nodes);
+    Prism::DependencyGraph built =
+        Prism::GraphBuilder("Demo").Build(result.nodes, result.fileLineCounts);
+    Prism::MetricsEngine().Annotate(built);
+    return built;
   }();
   return graph;
 }
@@ -122,6 +127,40 @@ DESCRIBE("HeaderExtraction", {
       }
     }
     ASSERT_TRUE(found);
+  });
+
+  IT("prefers the definition for a method's source span", {
+    // Orbit::Steps is declared in orbit.hpp but defined in orbit.cpp, so its
+    // node should carry the definition's file and lines of code.
+    const Prism::GraphNode* steps = FindByName(SharedGraph(), Prism::NodeKind::Function, "Steps");
+    ASSERT_TRUE(steps != nullptr);
+    ASSERT_EQUAL(std::string("orbit.cpp"), steps->file);
+    ASSERT_TRUE(steps != nullptr && steps->linesOfCode.has_value());
+  });
+
+  IT("gives file nodes their physical line count", {
+    for (const Prism::GraphNode& node : SharedGraph().nodes) {
+      if (node.kind == Prism::NodeKind::File) {
+        ASSERT_TRUE(node.linesOfCode.has_value());
+        ASSERT_TRUE(node.linesOfCode.value_or(0) > 0);
+      }
+    }
+  });
+
+  IT("aggregates project LOC from its files", {
+    int fileTotal = 0;
+    const Prism::GraphNode* project = nullptr;
+    for (const Prism::GraphNode& node : SharedGraph().nodes) {
+      if (node.kind == Prism::NodeKind::File) {
+        fileTotal += node.linesOfCode.value_or(0);
+      }
+      if (node.kind == Prism::NodeKind::Project) {
+        project = &node;
+      }
+    }
+    ASSERT_TRUE(project != nullptr);
+    ASSERT_TRUE(project != nullptr && project->linesOfCode.has_value());
+    ASSERT_EQUAL(fileTotal, project->linesOfCode.value_or(-1));
   });
 });
 
