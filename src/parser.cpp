@@ -4,6 +4,7 @@
 #include <clang-c/CXString.h>
 #include <clang-c/Index.h>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -69,15 +70,67 @@ std::string RelativePath(const std::string& target, const std::filesystem::path&
   return relative.generic_string();
 }
 
-/// True when `absolutePath` resolves to a location inside `projectRoot`.
-bool IsInProjectScope(const std::string& absolutePath, const std::filesystem::path& projectRoot)
+std::string ToLower(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value;
+}
+
+/// Directory names skipped by default: common build outputs and vendored /
+/// fetched dependency locations that live inside a project tree.
+const std::unordered_set<std::string>& DefaultExcludedDirectories()
+{
+  static const std::unordered_set<std::string> defaults = {
+      "build",
+      "_deps",
+      "deps",
+      "vendor",
+      "third_party",
+      "thirdparty",
+      "third-party",
+      "external",
+      "extern",
+      "node_modules",
+      ".git",
+      ".svn",
+      ".hg",
+  };
+  return defaults;
+}
+
+/// True when the project-relative path passes through an excluded directory
+/// segment (exact match, case-insensitive) or a `cmake-build*` directory.
+bool IsExcludedRelative(
+    const std::filesystem::path& relative, const std::unordered_set<std::string>& excluded
+)
+{
+  for (const std::filesystem::path& segment : relative) {
+    const std::string name = ToLower(segment.string());
+    if (excluded.count(name) != 0 || name.starts_with("cmake-build")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Whether a file should contribute to the analysis: inside the project root and
+/// not within an excluded (build / dependency) directory.
+bool ShouldAnalyse(
+    const std::string& absolutePath, const std::filesystem::path& projectRoot,
+    const std::unordered_set<std::string>& excluded
+)
 {
   if (absolutePath.empty()) {
     return false;
   }
   std::filesystem::path relative =
       Canonicalise(absolutePath).lexically_relative(Canonicalise(projectRoot));
-  return !relative.empty() && *relative.begin() != "..";
+  if (relative.empty() || *relative.begin() == "..") {
+    return false;
+  }
+  return !IsExcludedRelative(relative, excluded);
 }
 
 struct VisitContext {
@@ -85,7 +138,8 @@ struct VisitContext {
   std::filesystem::path projectRoot;
   int* idCounter;
   bool includeExternal;
-  std::unordered_set<std::string>* seen;  // dedup keys across translation units
+  std::unordered_set<std::string>* seen;            // dedup keys across translation units
+  const std::unordered_set<std::string>* excluded;  // excluded directory names
 };
 
 CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
@@ -101,14 +155,15 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   const std::string cursorFile = ToString(clang_getFileName(file));
 
   // Scope filter: skip cursors (and their subtrees) that live outside the
-  // project root, unless external analysis was explicitly requested. This is
-  // what lets project *headers* contribute declarations while excluding system
-  // and dependency headers. Cursors with no file (compiler builtins) are always
-  // skipped.
+  // project root or inside an excluded build/dependency directory, unless
+  // external analysis was explicitly requested. This is what lets project
+  // *headers* contribute declarations while excluding system and dependency
+  // headers. Cursors with no file (compiler builtins) are always skipped.
   if (cursorFile.empty()) {
     return CXChildVisit_Continue;
   }
-  if (!context->includeExternal && !IsInProjectScope(cursorFile, context->projectRoot)) {
+  if (!context->includeExternal &&
+      !ShouldAnalyse(cursorFile, context->projectRoot, *context->excluded)) {
     return CXChildVisit_Continue;
   }
 
@@ -285,6 +340,16 @@ ParseResult Parser::Parse()
     return result;
   }
 
+  // Effective excluded-directory set: built-in defaults (unless disabled) plus
+  // any names the caller added.
+  std::unordered_set<std::string> excluded;
+  if (config_.useDefaultExcludes) {
+    excluded = DefaultExcludedDirectories();
+  }
+  for (const std::string& name : config_.excludedDirectories) {
+    excluded.insert(ToLower(name));
+  }
+
   CXIndex index = clang_createIndex(0, 0);
   CXCompileCommands commands = clang_CompilationDatabase_getAllCompileCommands(database);
   const unsigned commandCount = clang_CompileCommands_getSize(commands);
@@ -302,10 +367,10 @@ ParseResult Parser::Parse()
     }
     const std::string sourceFile = sourcePath.lexically_normal().string();
 
-    // Skip translation units whose source lives outside the project root. Their
-    // in-scope project headers are still reached through the TUs that live
-    // inside the root and include them.
-    if (!config_.includeExternal && !IsInProjectScope(sourceFile, config_.projectRoot)) {
+    // Skip translation units whose source lives outside the project root or in
+    // an excluded build/dependency directory. Project headers are still reached
+    // through the in-root TUs that include them.
+    if (!config_.includeExternal && !ShouldAnalyse(sourceFile, config_.projectRoot, excluded)) {
       continue;
     }
 
@@ -353,7 +418,9 @@ ParseResult Parser::Parse()
     }
 
     CXCursor rootCursor = clang_getTranslationUnitCursor(unit);
-    VisitContext context{&result, config_.projectRoot, &idCounter, config_.includeExternal, &seen};
+    VisitContext context{
+        &result, config_.projectRoot, &idCounter, config_.includeExternal, &seen, &excluded
+    };
     clang_visitChildren(rootCursor, Visitor, &context);
 
     clang_disposeTranslationUnit(unit);

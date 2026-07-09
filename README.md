@@ -58,15 +58,21 @@ If `--compile-commands` is omitted, Prism looks for
 | `--output <path>` | no | `./analysis.json` | Where to write the analysis. |
 | `--compile-commands <path>` | no | `<project>/compile_commands.json` | Path to the compilation database (file or its directory). |
 | `--verbose` | no | off | Print per-stage progress and diagnostics. |
-| `--include-external` | no | off | Analyse every translation unit in the database, including files outside `--project` (dependencies, system headers). Off by default. |
+| `--include-external` | no | off | Analyse every translation unit in the database, including files outside `--project` (dependencies, system headers). Overrides all scoping and exclusions. |
+| `--exclude <dir>` | no | — | Skip any file whose path passes through a directory with this name. Repeatable; added on top of the built-in defaults. |
+| `--no-default-excludes` | no | off | Do not apply the built-in excluded-directory list (only your `--exclude` entries, if any). |
 | `--help`, `-h` | no | — | Print usage and exit. |
 
-> **Point `--project` at your source directory.** By default Prism only analyses
-> files under `--project`; anything outside is skipped. Because dependencies are
-> often vendored *inside* the repo (e.g. CMake FetchContent under `build/_deps/`),
-> pointing `--project` at the repository root pulls those in too. Point it at the
-> source tree (e.g. `<repo>/src`) to get a clean, project-only graph, or pass
-> `--include-external` to deliberately analyse everything.
+> **Scoping and dependency exclusion.** By default Prism analyses only files
+> under `--project`, and additionally skips files inside common build/dependency
+> directories even when they live in-tree. This means you can point `--project`
+> at the repository root and still get a clean, project-only graph — vendored
+> dependencies (e.g. CMake FetchContent under `build/_deps/`) are excluded
+> automatically. The built-in skip list covers `build`, `cmake-build*`, `_deps`,
+> `deps`, `vendor`, `third_party` / `thirdparty` / `third-party`, `external`,
+> `extern`, `node_modules`, and `.git` / `.svn` / `.hg`. Use `--exclude <dir>`
+> to add more, `--no-default-excludes` to start from an empty list, or
+> `--include-external` to analyse everything.
 
 Prism exits `0` on success and `1` on a pipeline failure (bad arguments, missing
 project directory, unreadable compilation database, or an export failure).

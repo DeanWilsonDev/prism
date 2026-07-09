@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "firefly/log.hpp"
 #include "prism/exporter.hpp"
 #include "prism/graph-builder.hpp"
@@ -19,13 +20,15 @@ struct CliOptions {
   std::filesystem::path compileCommandsPath;
   bool verbose = false;
   bool includeExternal = false;
+  std::vector<std::string> excludes;
+  bool useDefaultExcludes = true;
 };
 
 void PrintUsage(const char* program)
 {
   std::cerr << "Usage: " << program
-            << " --project <path> [--output <path>] [--compile-commands <path>] [--verbose] "
-               "[--include-external]\n";
+            << " --project <path> [--output <path>] [--compile-commands <path>] [--verbose]\n"
+               "            [--include-external] [--exclude <dir>]... [--no-default-excludes]\n";
 }
 
 }  // namespace
@@ -60,6 +63,12 @@ int main(int argc, char** argv)
     }
     else if (argument == "--include-external") {
       options.includeExternal = true;
+    }
+    else if (argument == "--exclude") {
+      options.excludes.emplace_back(nextValue(argument));
+    }
+    else if (argument == "--no-default-excludes") {
+      options.useDefaultExcludes = false;
     }
     else if (argument == "--help" || argument == "-h") {
       PrintUsage(argv[0]);
@@ -114,6 +123,8 @@ int main(int argc, char** argv)
   parserConfig.compileCommandsPath = options.compileCommandsPath;
   parserConfig.verbose = options.verbose;
   parserConfig.includeExternal = options.includeExternal;
+  parserConfig.excludedDirectories = options.excludes;
+  parserConfig.useDefaultExcludes = options.useDefaultExcludes;
 
   Prism::Parser parser(parserConfig);
   Prism::ParseResult parseResult = parser.Parse();

@@ -733,13 +733,16 @@ Three refinements beyond the plan above were needed once the changes were tested
    node, so its id is `Project::…::including-file::included-name` — unique per (file, include). Include
    *edges* were already de-duplicated by `(includingFile, includedFile)` and were unaffected.
 
-3. **Vendored dependencies live *inside* the repo.** Project-root scoping (Enhancement B) excludes code
-   outside `--project`, but dependencies fetched under `build/_deps/` (FetchContent) sit *inside* the
-   repo root and are therefore still in scope. The practical guidance is to point `--project` at the
-   source directory (e.g. `<repo>/src`) rather than the repo root; doing so on the test project reduced
-   the graph from 1835 nodes (deps included) to 359 project-only nodes with 2 legitimate duplicate-id
-   warnings (both real member overloads). A built-in build-directory exclusion was considered but left
-   out to avoid baking in a heuristic; revisit if this proves a common pain point.
+3. **Vendored dependencies live *inside* the repo — excluded by default.** Project-root scoping
+   (Enhancement B) excludes code outside `--project`, but dependencies fetched under `build/_deps/`
+   (FetchContent) sit *inside* the repo root and would otherwise remain in scope. Prism therefore also
+   skips files whose path passes through a build/dependency directory: the default set is `build`,
+   `cmake-build*`, `_deps`, `deps`, `vendor`, `third_party` / `thirdparty` / `third-party`, `external`,
+   `extern`, `node_modules`, and `.git` / `.svn` / `.hg`. `--exclude <dir>` extends the set,
+   `--no-default-excludes` starts from empty, and `--include-external` bypasses all filtering. With this
+   in place, pointing `--project` at the repo root of the test project yields the same clean 360-node
+   project-only graph as manually scoping to `<repo>/src` (down from 1835 with deps), with 2 legitimate
+   duplicate-id warnings (both real member overloads).
 
 ---
 

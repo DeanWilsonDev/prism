@@ -44,6 +44,21 @@ Prism::ParseResult ParseOrbit(bool includeExternal, const std::filesystem::path&
   return Prism::Parser(config).Parse();
 }
 
+// Parse orbit.cpp scoped to the parent of the example dir (so its relative path
+// is "example/orbit.cpp"), optionally excluding the "example" directory.
+Prism::ParseResult ParseOrbitExcludingExample(bool excludeExample)
+{
+  Prism::Logging::Log::Init();
+  const std::filesystem::path databaseDir = WriteOrbitDatabase();
+  Prism::ParserConfig config;
+  config.projectRoot = std::filesystem::path(PRISM_TEST_EXAMPLE_DIR).parent_path();
+  config.compileCommandsPath = databaseDir / "compile_commands.json";
+  if (excludeExample) {
+    config.excludedDirectories = {"example"};
+  }
+  return Prism::Parser(config).Parse();
+}
+
 // Full parse + build against the orbit fixture, scoped to src/example.
 const Prism::DependencyGraph& SharedGraph()
 {
@@ -126,4 +141,12 @@ DESCRIBE("ProjectScope", {
     Prism::ParseResult external = ParseOrbit(true, narrowRoot);
     ASSERT_TRUE(ParseHasClass(external, "Orbit"));
   });
+});
+
+DESCRIBE("DirectoryExclusion", {
+  IT("skips files under an excluded directory name",
+     { ASSERT_FALSE(ParseHasClass(ParseOrbitExcludingExample(true), "Orbit")); });
+
+  IT("keeps files when the directory is not excluded",
+     { ASSERT_TRUE(ParseHasClass(ParseOrbitExcludingExample(false), "Orbit")); });
 });

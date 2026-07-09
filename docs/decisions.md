@@ -201,13 +201,21 @@ notes):
 - **Include nodes are file-scoped.** Their ids are built from the including file
   node (`…::renderer.h::vector`), not the module, so the same header included by
   many files no longer collides.
-- **Vendored deps sit inside the repo.** FetchContent places dependencies under
-  `build/_deps/`, which is *inside* the project root, so root-scoping alone does
-  not exclude them. Guidance: point `--project` at the source directory
-  (`<repo>/src`). On the test project this took the graph from 1835 nodes (deps
-  included) to 359 project-only nodes, and duplicate-id warnings from 421 to 2
-  (both genuine member overloads). A built-in build-directory exclusion was
-  considered but deliberately not added, to avoid baking in a heuristic.
+- **Vendored deps sit inside the repo — excluded by default.** FetchContent
+  places dependencies under `build/_deps/`, which is *inside* the project root,
+  so root-scoping alone does not exclude them. Prism therefore also skips files
+  whose path passes through a build/dependency directory. The default set is
+  `build`, `cmake-build*`, `_deps`, `deps`, `vendor`, `third_party` /
+  `thirdparty` / `third-party`, `external`, `extern`, `node_modules`, and
+  `.git` / `.svn` / `.hg`. `--exclude <dir>` extends it, `--no-default-excludes`
+  starts from empty, and `--include-external` bypasses all filtering. The
+  matching is on lowercased path segments (exact, plus a `cmake-build*` prefix).
+  With this, pointing `--project` at the repo root gives the same clean
+  360-node project-only graph as manually scoping to `<repo>/src` (was 1835 with
+  deps), and duplicate-id warnings dropped from 421 to 2 (both genuine
+  overloads). Exact-segment matching keeps false positives unlikely (a dir named
+  `build_system` is not matched); pass `--no-default-excludes` if a project
+  legitimately keeps sources under one of these names.
 
 **Result on `vulkan-3d-orbit-viewer-poc/src`:** 15 classes/structs captured
 (were ~1), methods re-attached (e.g. `VulkanContext` = 23), 32 internal include

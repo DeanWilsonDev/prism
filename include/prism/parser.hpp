@@ -18,9 +18,15 @@ struct ParserConfig {
   std::filesystem::path compileCommandsPath;
   bool verbose = false;
   // When false (default), only files under projectRoot are analysed. When true,
-  // every translation unit in the database is parsed and declarations from any
-  // file (including dependencies and system headers) are captured.
+  // every translation unit is parsed and declarations from any file (including
+  // dependencies and system headers) are captured. Overrides all exclusions.
   bool includeExternal = false;
+  // Directory *names* (path segments) to skip even when inside projectRoot, so
+  // dependencies vendored in-tree (build/_deps, third_party, …) are ignored.
+  // The built-in defaults are applied unless useDefaultExcludes is false; these
+  // entries are added on top.
+  std::vector<std::string> excludedDirectories;
+  bool useDefaultExcludes = true;
 };
 
 /// Stage 1. Loads a compilation database, parses every translation unit with
