@@ -37,6 +37,9 @@ std::optional<NodeKind> MapCursorKind(CXCursorKind kind)
       return NodeKind::Struct;
     case CXCursor_FunctionDecl:
     case CXCursor_CXXMethod:
+    case CXCursor_Constructor:
+    case CXCursor_Destructor:
+    case CXCursor_ConversionFunction:
       return NodeKind::Function;
     case CXCursor_FieldDecl:
       return NodeKind::Field;

@@ -181,9 +181,12 @@ void MetricsEngine::ComputeCodeMetrics(DependencyGraph& graph)
     // Leaf lines of code: the inclusive span of the declaration's source extent.
     // Containers (file/module/namespace/project) are aggregated separately;
     // file nodes already carry their physical line count from the graph builder.
+    // lineEnd >= line always holds (GraphBuilder falls back to line when the
+    // parser has no real extent), so a single-line declaration is a genuine
+    // span of 1, not missing data — it must count, not be omitted.
     const bool isLeaf = node.kind == NodeKind::Function || node.kind == NodeKind::Class ||
                         node.kind == NodeKind::Struct || node.kind == NodeKind::Field;
-    if (isLeaf && node.lineEnd > node.line) {
+    if (isLeaf && node.lineEnd >= node.line) {
       node.linesOfCode = node.lineEnd - node.line + 1;
     }
 

@@ -94,21 +94,34 @@ and trailing separators to the real directory name (e.g. `prism`).
 **Decision.** `ASTNode` gained an `int lineEnd` field. The parser fills it from
 the cursor's source extent (`clang_getRangeEnd(clang_getCursorExtent(...))`),
 the graph builder copies it onto `GraphNode.lineEnd`, and the metrics engine
-sets `linesOfCode = lineEnd - line + 1` for any node with a real multi-line
-span.
+sets `linesOfCode = lineEnd - line + 1` for any node with a real span
+(`lineEnd >= line`, which always holds — the graph builder falls back to `line`
+when the parser has no extent, so the comparison never sees a genuinely-missing
+value).
 
 **Why.** The original pass left `linesOfCode` as `std::nullopt` because the spec
 said `ASTNode` needed no changes and therefore carried no extent end. With that
 constraint lifted, adding a single `lineEnd` field is the minimal way to make
 the metric real.
 
-**Consequence.** Namespaces, classes, structs, and multi-line functions/methods
-now report `lines_of_code`. Nodes without a genuine span — synthesised
-project/module/file nodes, and single-line declarations where `lineEnd == line`
-— are still omitted rather than reported as a misleading `1`, honouring the
-"never use a sentinel for a metric" rule. File-level line counts (whole-file
-LOC) remain unimplemented; they would require the metrics engine to open source
+**Consequence.** Namespaces, classes, structs, and functions/methods/fields —
+including single-line ones — now report `lines_of_code`. Synthesised
+project/module nodes with no line info of their own still get their LOC purely
+from aggregation, never a leaf value. File-level line counts (whole-file LOC)
+remain unimplemented; they would require the metrics engine to open source
 files, which it currently has no project-root context to do.
+
+**Correction (found while investigating a pharos LOC-integrity report).** This
+decision originally required `lineEnd > line` (strict), reasoning that a
+single-line declaration was "not a genuine span" and should be omitted rather
+than "misleadingly" reported as `1`. That reasoning was wrong: a one-line
+declaration has a real, correct span of exactly 1 line — it isn't missing data,
+it's a valid value that happens to equal 1. The strict comparison silently
+dropped `lines_of_code` for every one-line function, method, and field.
+Verified against `pharos-proto`: 12 of 96 `Function` nodes (getters, one-line
+predicates like `isLeaf()`/`hasChildren()`) and all 218 `Field` nodes — every
+member variable in the project, since member declarations are almost always
+one line — reported no LOC at all under the old check. Changed to `>=`.
 
 ---
 
@@ -255,9 +268,64 @@ module `engine` = 2115, namespace `Engine` = 461 (was 30), and the project total
 files that contribute no captured cursors (e.g. pure forward-declaration or
 macro-only headers) and so never become file nodes.
 
-**Known limitation.** A namespace re-opened across several modules produces one
-node per module (its id embeds the module of first capture), so a namespace's
-aggregate reflects only the members whose logical parent is that particular node,
-not every block of that namespace across the whole project. Physical
-module/project aggregation is unaffected and is the reliable "all the lines under
-here" number.
+**Limitation, since resolved: see §11.** A namespace re-opened across several
+files/modules merges to a single node by USR, but that node's `physicalParent`
+(and, for top-level namespaces, `logicalParent`) was pinned to wherever the
+parser happened to visit it *first* — order depending on `compile_commands.json`
+iteration, not the namespace's actual footprint. Its aggregate LOC was always
+correct (it does correctly sum every member across every file that reopens it),
+but the node's place in the tree was arbitrary, so a namespace could appear
+nested under a directory that physically holds only a fraction of its content.
+Physical module/project aggregation was unaffected — see §11 for the fix.
+
+---
+
+## 11. Constructors, destructors, and conversion operators were invisible to the graph
+
+**Decision.** `MapCursorKind` (parser) now also maps `CXCursor_Constructor`,
+`CXCursor_Destructor`, and `CXCursor_ConversionFunction` to `NodeKind::Function`.
+
+**Why.** Found while investigating a pharos LOC-integrity report. libclang gives
+constructors, destructors, and conversion operators their own cursor kinds,
+distinct from `CXCursor_CXXMethod`. The switch in `MapCursorKind` (and the
+matching cursor-kind list in `prism-spec.md`) only ever covered
+`CXCursor_FunctionDecl` and `CXCursor_CXXMethod`, so every constructor,
+destructor, and conversion operator in any analysed project silently vanished —
+not reported with 0 LOC, simply never turned into an `ASTNode` at all. Verified
+with a standalone fixture (`Widget()` / `~Widget()` / `operator int()`): all
+three were absent from `analysis.json` before the fix and present with correct
+`lines_of_code` after.
+
+**Consequence.** Classes whose only substantial logic lives in a constructor or
+destructor now contribute that code to method counts and LOC totals. This was a
+gap since the original v0.2 spec (the cursor-kind list it specifies was already
+incomplete), not a regression.
+
+---
+
+## 12. Namespaces are re-anchored to where their content actually lives
+
+**Decision.** After the graph is fully built, a new pass (`ReanchorNamespaces` in
+`graph-builder.cpp`) walks every `Namespace` node and recomputes its
+`physicalParent` (and `logicalParent`, when it currently points at a
+module/project rather than an enclosing namespace) as the closest common
+`::`-ancestor of every file its logical children — recursively through nested
+namespaces — actually live in.
+
+**Why.** Found via the same pharos LOC-integrity report: the physical tree and
+the logical tree appeared to disagree. Root cause was the limitation described
+in §10 — `namespace pharos`, reopened across `ui/`, `data/`, `layout/`,
+`icons/`, and `metrics/`, was anchored under the `icons` module (369 physical
+lines) simply because that was the first file the parser visited, while its
+logical LOC (2271, gathered correctly from every file) made it look wildly
+inconsistent with its physical home. Re-anchoring it to the common ancestor of
+its actual content places it at `pharos-proto::src` — the true home — while a
+namespace whose content genuinely lives in one file (`pharos::icons`) still
+collapses precisely to that file, not a directory.
+
+**Consequence.** A namespace's tree position no longer depends on translation
+unit visitation order, and is consistent whichever tree (physical or logical)
+it's viewed from. Physical file/module/project LOC totals are unaffected: this
+pass only changes where a namespace node is nested, not the summation math
+(namespaces were never part of the physical aggregation walk, only files and
+modules are).

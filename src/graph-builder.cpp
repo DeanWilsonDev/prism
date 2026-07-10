@@ -1,7 +1,9 @@
 #include "prism/graph-builder.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <map>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,6 +38,111 @@ PathParts SplitPath(const std::string& relativePath)
 bool IsLogicalContainer(NodeKind kind)
 {
   return kind == NodeKind::Namespace || kind == NodeKind::Class || kind == NodeKind::Struct;
+}
+
+/// Split a node id ("Project::dirA::dirB::file.cpp") into its "::" segments.
+std::vector<std::string> SplitId(const std::string& id)
+{
+  std::vector<std::string> segments;
+  std::size_t start = 0;
+  while (true) {
+    const std::size_t pos = id.find("::", start);
+    if (pos == std::string::npos) {
+      segments.push_back(id.substr(start));
+      break;
+    }
+    segments.push_back(id.substr(start, pos - start));
+    start = pos + 2;
+  }
+  return segments;
+}
+
+/// Longest shared "::"-delimited prefix of two node ids: their closest common
+/// ancestor in the physical/module hierarchy (could be a file, module, or the
+/// project root).
+std::string CommonAncestorId(const std::string& lhs, const std::string& rhs)
+{
+  const std::vector<std::string> lhsParts = SplitId(lhs);
+  const std::vector<std::string> rhsParts = SplitId(rhs);
+  const std::size_t limit = std::min(lhsParts.size(), rhsParts.size());
+  std::size_t shared = 0;
+  while (shared < limit && lhsParts[shared] == rhsParts[shared]) {
+    ++shared;
+  }
+  std::string joined;
+  for (std::size_t index = 0; index < shared; ++index) {
+    if (index > 0) {
+      joined += "::";
+    }
+    joined += lhsParts[index];
+  }
+  return joined;
+}
+
+/// A namespace is reopened in every file that contributes to it, so pinning it
+/// to whichever file the parser happened to visit first (the default from the
+/// main node-creation pass) is arbitrary and can leave a namespace's logical
+/// LOC total — gathered from every file that reopens it — nested under a
+/// directory that physically holds only a fraction of that code. This second
+/// pass re-anchors each namespace to the closest common ancestor (file, module,
+/// or project) of everywhere its content actually lives, so the physical tree
+/// and the logical tree agree on where a namespace's weight sits.
+void ReanchorNamespaces(DependencyGraph& graph)
+{
+  std::unordered_map<std::string, GraphNode*> byId;
+  std::unordered_map<std::string, std::vector<std::string>> logicalChildren;
+  for (GraphNode& node : graph.nodes) {
+    byId[node.id] = &node;
+    if (!node.logicalParent.empty()) {
+      logicalChildren[node.logicalParent].push_back(node.id);
+    }
+  }
+
+  std::unordered_map<std::string, std::optional<std::string>> memo;
+  std::function<std::optional<std::string>(const std::string&)> homeOf =
+      [&](const std::string& id) -> std::optional<std::string> {
+    if (auto cached = memo.find(id); cached != memo.end()) {
+      return cached->second;
+    }
+    memo[id] = std::nullopt;  // guard against namespace-nesting cycles
+    std::optional<std::string> home;
+    for (const std::string& childId : logicalChildren[id]) {
+      GraphNode* child = byId[childId];
+      std::optional<std::string> childLocation = (child->kind == NodeKind::Namespace)
+                                                       ? homeOf(childId)
+                                                       : std::optional(child->physicalParent);
+      if (childLocation.has_value() && !childLocation->empty()) {
+        home = home.has_value() ? CommonAncestorId(*home, *childLocation) : childLocation;
+      }
+    }
+    memo[id] = home;
+    return home;
+  };
+
+  for (GraphNode& node : graph.nodes) {
+    if (node.kind != NodeKind::Namespace) {
+      continue;
+    }
+    const std::optional<std::string> home = homeOf(node.id);
+    if (!home.has_value()) {
+      continue;  // an empty namespace: leave its original anchor alone
+    }
+    node.physicalParent = *home;
+
+    // Only reassign logicalParent when it currently points at a module/project
+    // (i.e. this is a top-level namespace); a nested namespace's logicalParent
+    // already correctly points at its enclosing namespace via USR and must
+    // stay put. logicalParent must land on a module/project, never a file.
+    auto currentParent = byId.find(node.logicalParent);
+    if (currentParent != byId.end() &&
+        (currentParent->second->kind == NodeKind::Module ||
+         currentParent->second->kind == NodeKind::Project)) {
+      GraphNode* homeNode = byId.count(*home) ? byId[*home] : nullptr;
+      node.logicalParent = (homeNode != nullptr && homeNode->kind == NodeKind::File)
+                                ? homeNode->physicalParent
+                                : *home;
+    }
+  }
 }
 
 }  // namespace
@@ -261,6 +368,8 @@ DependencyGraph GraphBuilder::Build(
   for (auto& [key, edge] : edgeAccumulator) {
     graph.AddEdge(edge);
   }
+
+  ReanchorNamespaces(graph);
 
   return graph;
 }
