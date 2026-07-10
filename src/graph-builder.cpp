@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 #include "firefly/log.hpp"
 
 namespace Prism {
@@ -109,8 +110,8 @@ void ReanchorNamespaces(DependencyGraph& graph)
     for (const std::string& childId : logicalChildren[id]) {
       GraphNode* child = byId[childId];
       std::optional<std::string> childLocation = (child->kind == NodeKind::Namespace)
-                                                       ? homeOf(childId)
-                                                       : std::optional(child->physicalParent);
+                                                     ? homeOf(childId)
+                                                     : std::optional(child->physicalParent);
       if (childLocation.has_value() && !childLocation->empty()) {
         home = home.has_value() ? CommonAncestorId(*home, *childLocation) : childLocation;
       }
@@ -134,13 +135,12 @@ void ReanchorNamespaces(DependencyGraph& graph)
     // already correctly points at its enclosing namespace via USR and must
     // stay put. logicalParent must land on a module/project, never a file.
     auto currentParent = byId.find(node.logicalParent);
-    if (currentParent != byId.end() &&
-        (currentParent->second->kind == NodeKind::Module ||
-         currentParent->second->kind == NodeKind::Project)) {
+    if (currentParent != byId.end() && (currentParent->second->kind == NodeKind::Module ||
+                                        currentParent->second->kind == NodeKind::Project)) {
       GraphNode* homeNode = byId.count(*home) ? byId[*home] : nullptr;
       node.logicalParent = (homeNode != nullptr && homeNode->kind == NodeKind::File)
-                                ? homeNode->physicalParent
-                                : *home;
+                               ? homeNode->physicalParent
+                               : *home;
     }
   }
 }
@@ -172,8 +172,11 @@ DependencyGraph GraphBuilder::Build(
   std::unordered_map<std::string, std::string> logicalNameToId;
   // Project-relative path -> file node id, for resolving include targets.
   std::unordered_map<std::string, std::string> relativePathToFileId;
-  // Class/struct simple name -> node id, for inheritance / composition targets.
+  // Class/struct simple name -> node id: fallback for inheritance / composition
+  // targets when the parser supplied no USRs (hand-built ASTNodes in tests).
   std::unordered_map<std::string, std::string> typeNameToId;
+  // Ids of the class/struct nodes, so an edge can be restricted to project types.
+  std::unordered_set<std::string> typeIds;
 
   // Ensure a file node (and its module chain) exist. Returns the file node id
   // and the deepest module id (project id when the file sits at the root).
@@ -271,18 +274,26 @@ DependencyGraph GraphBuilder::Build(
       logicalParentId = fileId;
     }
 
+    const bool isAnonymousNamespace = node.kind == NodeKind::Namespace && node.name.empty();
+
     GraphNode graphNode;
-    graphNode.name = node.name;
+    graphNode.name = isAnonymousNamespace ? "anonymous" : node.name;
     graphNode.kind = node.kind;
     graphNode.file = SplitPath(node.file).filename;
     graphNode.line = node.line;
     graphNode.column = node.column;
     graphNode.lineEnd = (node.lineEnd > 0) ? node.lineEnd : node.line;
     graphNode.referencedName = node.referencedName;
+    graphNode.cyclomaticComplexity = node.cyclomaticComplexity;
     graphNode.physicalParent = fileId;
     graphNode.logicalParent = logicalParentId;
 
-    std::string baseId = logicalParentId + "::" + (node.name.empty() ? "anonymous" : node.name);
+    // An anonymous namespace is file-local, and every .cpp in a directory has
+    // its own. Scoping the id to the module would collide them all onto one id.
+    std::string baseId =
+        isAnonymousNamespace
+            ? fileId + "::anonymous"
+            : logicalParentId + "::" + (node.name.empty() ? "anonymous" : node.name);
     graphNode.id = uniqueId(baseId);
 
     if (!node.usr.empty()) {
@@ -293,6 +304,7 @@ DependencyGraph GraphBuilder::Build(
     }
     if (node.kind == NodeKind::Class || node.kind == NodeKind::Struct) {
       typeNameToId[node.name] = graphNode.id;
+      typeIds.insert(graphNode.id);
     }
 
     const std::string createdId = graphNode.id;
@@ -341,23 +353,47 @@ DependencyGraph GraphBuilder::Build(
     addEdge(pending.fileId, target, EdgeKind::IncludeDependency);
   }
 
-  // Inheritance edges: derived class -> base class (looked up by name).
+  // Ids of the class/struct nodes the parser resolved a reference to. Falls back
+  // to matching the referenced *name* against known types, which is all a
+  // hand-built ASTNode (no USRs) can offer. The name fallback is an exact match:
+  // a substring test reports `EdgeKind` as a reference to `Edge`.
+  auto resolveReferencedTypes = [&](const ASTNode& source) {
+    std::vector<std::string> targets;
+    for (const std::string& usr : source.referencedUsrs) {
+      auto it = usrToId.find(usr);
+      if (it != usrToId.end() && typeIds.count(it->second) != 0) {
+        targets.push_back(it->second);
+      }
+    }
+    if (targets.empty() && source.referencedUsrs.empty()) {
+      if (auto it = typeNameToId.find(source.referencedName); it != typeNameToId.end()) {
+        targets.push_back(it->second);
+      }
+    }
+    return targets;
+  };
+
+  // Inheritance edges: derived class -> base class.
   for (const PendingEdge& pending : inheritanceEdges) {
-    auto it = typeNameToId.find(pending.source.referencedName);
-    const std::string target =
-        (it != typeNameToId.end()) ? it->second : pending.source.referencedName;
-    addEdge(pending.ownerId, target, EdgeKind::Inheritance);
+    const std::vector<std::string> targets = resolveReferencedTypes(pending.source);
+    if (targets.empty()) {
+      // An unresolved base (a system or dependency type) keeps its bare name as
+      // the edge target, so the relationship is still visible in the output.
+      addEdge(pending.ownerId, pending.source.referencedName, EdgeKind::Inheritance);
+      continue;
+    }
+    for (const std::string& target : targets) {
+      addEdge(pending.ownerId, target, EdgeKind::Inheritance);
+    }
   }
 
-  // Composition edges: owning class -> field type, when the type is a known class.
+  // Composition edges: owning class -> each project type its field is built from.
+  // A field of type std::vector<GraphNode> composes GraphNode; std::vector itself
+  // resolves to no project node and drops out. A class is not composed of itself.
   for (const PendingEdge& pending : compositionEdges) {
-    for (const auto& [typeName, typeId] : typeNameToId) {
-      const std::string& referenced = pending.source.referencedName;
-      // Match the type name as a whole token within the field's type spelling
-      // (e.g. "Prism::TestEquals" or "TestEquals*" both reference TestEquals).
-      if (referenced.find(typeName) != std::string::npos && !typeName.empty()) {
-        addEdge(pending.ownerId, typeId, EdgeKind::Composition);
-        break;
+    for (const std::string& target : resolveReferencedTypes(pending.source)) {
+      if (target != pending.ownerId) {
+        addEdge(pending.ownerId, target, EdgeKind::Composition);
       }
     }
   }

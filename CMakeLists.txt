@@ -72,6 +72,17 @@ target_precompile_headers(${PROJECT_NAME}-core PRIVATE include/pch.hpp)
 target_include_directories(${PROJECT_NAME}-core PUBLIC include)
 target_include_directories(${PROJECT_NAME}-core PRIVATE ${CLANG_INCLUDE_DIRS})
 
+# libclang derives its resource directory (where the compiler's own builtin
+# headers -- stdarg.h, stddef.h, immintrin.h -- live) from the path of the
+# running executable. That works for the `clang` binary and not for anything
+# else linking libclang, so Prism cannot find them and every translation unit
+# that transitively includes a builtin header fails to resolve. Bake in the
+# resource directory of the libclang we linked against; -resource-dir on the
+# command line still wins.
+target_compile_definitions(
+  ${PROJECT_NAME}-core
+  PRIVATE PRISM_CLANG_RESOURCE_DIR="${LLVM_LIBRARY_DIR}/clang/${LLVM_VERSION_MAJOR}")
+
 target_link_libraries(${PROJECT_NAME}-core PUBLIC libclang firefly amanuensis)
 
 add_executable(${PROJECT_NAME} src/main.cpp src/example/test-input.cpp)
@@ -84,7 +95,7 @@ add_executable(
   ${PROJECT_NAME}-tests
   test/test-main.cpp test/exporter.test.cpp test/graph-builder.test.cpp
   test/parser.test.cpp test/metrics-engine.test.cpp
-  test/header-extraction.test.cpp)
+  test/metrics-accuracy.test.cpp test/header-extraction.test.cpp)
 
 target_include_directories(${PROJECT_NAME}-tests PRIVATE include)
 

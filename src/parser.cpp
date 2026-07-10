@@ -4,8 +4,11 @@
 #include <clang-c/CXString.h>
 #include <clang-c/Index.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -139,6 +142,138 @@ bool ShouldAnalyse(
   return !IsExcludedRelative(relative, excluded);
 }
 
+#if defined(__APPLE__)
+/// The clang *driver* discovers the macOS SDK (via SDKROOT or `xcrun`) and
+/// passes -isysroot down to the frontend; libclang skips the driver, so a
+/// compile command produced by Apple clang — which never needs an explicit
+/// -isysroot — leaves libclang unable to find the C++ standard library. Clang
+/// then error-recovers rather than bailing out, and every unresolved type
+/// silently degrades to `int`, so a std::string field looks like an int and the
+/// metrics computed over it are quietly wrong. Recover the SDK path once.
+const std::string& MacOsSdkPath()
+{
+  static const std::string path = []() -> std::string {
+    if (const char* fromEnvironment = std::getenv("SDKROOT");
+        fromEnvironment != nullptr && *fromEnvironment != '\0') {
+      return fromEnvironment;
+    }
+    std::string discovered;
+    FILE* pipe = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+    if (pipe == nullptr) {
+      return discovered;
+    }
+    std::array<char, 512> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+      discovered += buffer.data();
+    }
+    pclose(pipe);
+    while (!discovered.empty() && (discovered.back() == '\n' || discovered.back() == '\r')) {
+      discovered.pop_back();
+    }
+    return discovered;
+  }();
+  return path;
+}
+#endif
+
+/// USRs of every declaration reachable from a type, once pointers, references,
+/// arrays and cv-qualifiers are peeled away, plus the same walk over each
+/// template argument. `std::vector<GraphNode>` therefore yields the USRs of both
+/// std::vector and GraphNode, and the graph builder keeps whichever of them is a
+/// node in the project. This replaces matching class names against type
+/// spellings, which reported `EdgeKind` as a reference to `Edge`.
+void CollectTypeUsrs(CXType type, std::vector<std::string>& usrs, int depth = 0)
+{
+  constexpr int maxDepth = 8;
+  if (depth > maxDepth || type.kind == CXType_Invalid) {
+    return;
+  }
+
+  while (true) {
+    const CXType pointee = clang_getPointeeType(type);
+    if (pointee.kind != CXType_Invalid) {
+      type = pointee;
+      continue;
+    }
+    const CXType element = clang_getArrayElementType(type);
+    if (element.kind != CXType_Invalid) {
+      type = element;
+      continue;
+    }
+    break;
+  }
+  type = clang_getCanonicalType(clang_getUnqualifiedType(type));
+
+  const CXCursor declaration = clang_getTypeDeclaration(type);
+  if (!clang_Cursor_isNull(declaration)) {
+    std::string usr = ToString(clang_getCursorUSR(declaration));
+    if (!usr.empty() && std::find(usrs.begin(), usrs.end(), usr) == usrs.end()) {
+      usrs.push_back(std::move(usr));
+    }
+  }
+
+  const int templateArguments = clang_Type_getNumTemplateArguments(type);
+  for (int index = 0; index < templateArguments; ++index) {
+    CollectTypeUsrs(clang_Type_getTemplateArgumentAsType(type, index), usrs, depth + 1);
+  }
+}
+
+/// Clang gives every top-level anonymous namespace the same USR (`c:@aN`), so
+/// the cross-translation-unit dedup below would fold the unrelated anonymous
+/// namespaces of every .cpp into one node whose lines of code span files it has
+/// nothing to do with. An anonymous namespace is file-local by definition, so
+/// qualify its USR with the file to restore one node per file.
+std::string CursorUsr(CXCursor cursor, const std::string& file)
+{
+  std::string usr = ToString(clang_getCursorUSR(cursor));
+  if (usr.empty() || clang_getCursorKind(cursor) != CXCursor_Namespace) {
+    return usr;
+  }
+  if (ToString(clang_getCursorSpelling(cursor)).empty()) {
+    usr += "@anonymous@" + file;
+  }
+  return usr;
+}
+
+/// McCabe cyclomatic complexity: one, plus one for every point the control flow
+/// can branch. `switch` itself is not a branch — each of its `case` labels is —
+/// and `else` is not a branch, it is the fall-through of its `if`.
+int CyclomaticComplexity(CXCursor function)
+{
+  int decisionPoints = 0;
+  clang_visitChildren(
+      function,
+      [](CXCursor cursor, CXCursor, CXClientData data) {
+        auto* count = static_cast<int*>(data);
+        switch (clang_getCursorKind(cursor)) {
+          case CXCursor_IfStmt:
+          case CXCursor_ForStmt:
+          case CXCursor_CXXForRangeStmt:
+          case CXCursor_WhileStmt:
+          case CXCursor_DoStmt:
+          case CXCursor_CaseStmt:
+          case CXCursor_CXXCatchStmt:
+          case CXCursor_ConditionalOperator:
+            *count += 1;
+            break;
+          case CXCursor_BinaryOperator:
+          case CXCursor_CompoundAssignOperator: {
+            const CX_BinaryOperatorKind opcode = clang_Cursor_getBinaryOpcode(cursor);
+            if (opcode == CX_BO_LAnd || opcode == CX_BO_LOr) {
+              *count += 1;
+            }
+            break;
+          }
+          default:
+            break;
+        }
+        return CXChildVisit_Recurse;
+      },
+      &decisionPoints
+  );
+  return 1 + decisionPoints;
+}
+
 struct VisitContext {
   ParseResult* result;
   std::filesystem::path projectRoot;
@@ -211,7 +346,8 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   node.kind = mappedKind.value();
   node.name = ToString(clang_getCursorSpelling(cursor));
   node.type = ToString(clang_getTypeSpelling(clang_getCursorType(cursor)));
-  node.usr = ToString(clang_getCursorUSR(cursor));
+  node.file = RelativePath(cursorFile, context->projectRoot);
+  node.usr = CursorUsr(cursor, node.file);
 
   node.line = static_cast<int>(line);
   node.column = static_cast<int>(column);
@@ -225,8 +361,12 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   clang_getExpansionLocation(endLocation, nullptr, &endLine, &endColumn, &endOffset);
   node.lineEnd = (endLine >= line) ? static_cast<int>(endLine) : static_cast<int>(line);
 
-  node.file = RelativePath(cursorFile, context->projectRoot);
   node.physicalParent = std::filesystem::path(node.file).parent_path().generic_string();
+
+  const bool isDefinition = clang_isCursorDefinition(cursor) != 0;
+  if (node.kind == NodeKind::Function && isDefinition) {
+    node.cyclomaticComplexity = CyclomaticComplexity(cursor);
+  }
 
   // Record the file's physical line count once, so file/module LOC can be
   // aggregated later. Keyed by the project-relative path used for file nodes.
@@ -244,7 +384,9 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   if (!clang_Cursor_isNull(logicalParentCursor) &&
       clang_getCursorKind(logicalParentCursor) != CXCursor_TranslationUnit) {
     node.logicalParent = ToString(clang_getCursorSpelling(logicalParentCursor));
-    node.semanticParentUsr = ToString(clang_getCursorUSR(logicalParentCursor));
+    // Same file as this cursor: an anonymous namespace cannot span files, so the
+    // salt CursorUsr() applies matches the one its members compute for it.
+    node.semanticParentUsr = CursorUsr(logicalParentCursor, node.file);
   }
 
   // Referenced name for relationship-bearing kinds.
@@ -270,10 +412,12 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
       if (node.name.empty()) {
         node.name = baseName;
       }
+      CollectTypeUsrs(clang_getCursorType(cursor), node.referencedUsrs);
       break;
     }
     case NodeKind::Field:
       node.referencedName = node.type;
+      CollectTypeUsrs(clang_getCursorType(cursor), node.referencedUsrs);
       break;
     default:
       break;
@@ -285,7 +429,6 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   // *definition* win: when the definition arrives after a declaration was
   // captured, upgrade the stored node's source span (so its lines of code
   // reflect the body, not the signature) and its file.
-  const bool isDefinition = clang_isCursorDefinition(cursor) != 0;
   if (!node.usr.empty()) {
     auto existing = context->usrToIndex->find(node.usr);
     if (existing != context->usrToIndex->end()) {
@@ -297,6 +440,8 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
         stored.file = node.file;
         stored.physicalParent = node.physicalParent;
         stored.type = node.type;
+        // Only the definition has a body to measure.
+        stored.cyclomaticComplexity = node.cyclomaticComplexity;
       }
       return CXChildVisit_Recurse;  // already captured in another TU
     }
@@ -332,40 +477,87 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
 /// Build the libclang argument list for a compile command, dropping flags that
 /// break out-of-tree reparsing (output selection, precompiled headers) and the
 /// source file itself (passed separately to clang_parseTranslationUnit).
+///
+/// `-Xclang` forwards the *following* token to cc1, so flags and their values
+/// can each arrive wrapped in their own `-Xclang`. CMake emits precompiled
+/// headers as `-Xclang -include-pch -Xclang <path>`; dropping `-include-pch`
+/// plus the one token after it would eat the second `-Xclang` and leave the
+/// path behind, so the wrapper has to be unwrapped before a flag is recognised
+/// and re-applied to whatever is kept.
 std::vector<std::string> BuildArguments(CXCompileCommand command, const std::string& sourceFile)
 {
   const std::string sourceName = std::filesystem::path(sourceFile).filename().string();
-  std::vector<std::string> arguments;
   const unsigned count = clang_CompileCommand_getNumArgs(command);
 
+  std::vector<std::string> raw;
+  raw.reserve(count);
+  for (unsigned index = 1; index < count; ++index) {  // skip argv[0], the compiler
+    raw.push_back(ToString(clang_CompileCommand_getArg(command, index)));
+  }
+
+  // Flags whose value is a separate token. That value may itself be wrapped.
+  auto takesValue = [](const std::string& value) {
+    return value == "-o" || value == "-include" || value == "-include-pch" || value == "-imacros";
+  };
+  // A precompiled header artefact. Matched on extension only: a substring test
+  // for "pch" would also swallow any -I path that happens to contain it.
   auto looksLikePch = [](const std::string& value) {
-    return value.find("pch") != std::string::npos || value.ends_with(".gch") ||
-           value.ends_with(".pch") || value.ends_with(".hxx");
+    return value.ends_with(".gch") || value.ends_with(".pch") || value.ends_with(".hxx");
   };
 
-  for (unsigned index = 1; index < count; ++index) {  // skip argv[0], the compiler
-    std::string argument = ToString(clang_CompileCommand_getArg(command, index));
-    if (argument == "-c" || argument == "-Winvalid-pch") {
+  std::vector<std::string> arguments;
+  std::size_t index = 0;
+  while (index < raw.size()) {
+    const bool wrapped = raw[index] == "-Xclang" && index + 1 < raw.size();
+    const std::string& flag = wrapped ? raw[index + 1] : raw[index];
+    index += wrapped ? 2 : 1;
+
+    if (flag == "-c" || flag == "-Winvalid-pch") {
       continue;
     }
-    if (argument == "-o" || argument == "-include" || argument == "-include-pch") {
-      if (index + 1 < count) {
-        ++index;  // drop the paired value as well
+    if (takesValue(flag)) {
+      if (index < raw.size() && raw[index] == "-Xclang") {
+        ++index;  // the value carries its own -Xclang wrapper
+      }
+      if (index < raw.size()) {
+        ++index;  // the value itself
       }
       continue;
     }
-    if (argument.ends_with(".o")) {
+    if (flag.ends_with(".o") || looksLikePch(flag)) {
       continue;
     }
-    if (argument == sourceFile || argument == sourceName ||
-        std::filesystem::path(argument).filename().string() == sourceName) {
+    if (flag == sourceFile || flag == sourceName ||
+        std::filesystem::path(flag).filename().string() == sourceName) {
       continue;
     }
-    if (looksLikePch(argument)) {
-      continue;
+
+    if (wrapped) {
+      arguments.emplace_back("-Xclang");
     }
-    arguments.push_back(std::move(argument));
+    arguments.push_back(flag);
   }
+
+  auto hasFlag = [&arguments](std::string_view prefix) {
+    return std::any_of(arguments.begin(), arguments.end(), [prefix](const std::string& argument) {
+      return argument.starts_with(prefix);
+    });
+  };
+
+#if defined(PRISM_CLANG_RESOURCE_DIR)
+  if (!hasFlag("-resource-dir")) {
+    arguments.emplace_back("-resource-dir");
+    arguments.emplace_back(PRISM_CLANG_RESOURCE_DIR);
+  }
+#endif
+
+#if defined(__APPLE__)
+  if (!hasFlag("-isysroot") && !hasFlag("--sysroot") && !MacOsSdkPath().empty()) {
+    arguments.emplace_back("-isysroot");
+    arguments.push_back(MacOsSdkPath());
+  }
+#endif
+
   return arguments;
 }
 
@@ -461,17 +653,22 @@ ParseResult Parser::Parse()
       continue;
     }
 
+    // An error diagnostic means clang recovered rather than gave up: the cursor
+    // tree still walks, but unresolved types silently degrade (a std::string
+    // field reports as `int`), which quietly corrupts every downstream metric.
+    // Surface the first error so a bad argument list is diagnosable.
     const unsigned diagnosticCount = clang_getNumDiagnostics(unit);
-    bool hasErrorDiagnostic = false;
+    std::string firstError;
     for (unsigned diagnosticIndex = 0; diagnosticIndex < diagnosticCount; ++diagnosticIndex) {
       CXDiagnostic diagnostic = clang_getDiagnostic(unit, diagnosticIndex);
-      if (clang_getDiagnosticSeverity(diagnostic) >= CXDiagnostic_Error) {
-        hasErrorDiagnostic = true;
+      if (firstError.empty() && clang_getDiagnosticSeverity(diagnostic) >= CXDiagnostic_Error) {
+        firstError = ToString(clang_getDiagnosticSpelling(diagnostic));
       }
       clang_disposeDiagnostic(diagnostic);
     }
-    if (hasErrorDiagnostic) {
-      const std::string warning = "Parse diagnostics reported errors in: " + sourceFile;
+    if (!firstError.empty()) {
+      const std::string warning =
+          "Parse diagnostics reported errors in: " + sourceFile + " (first: " + firstError + ")";
       LOG_WARNING("{}", warning);
       result.warnings.push_back(warning);
     }

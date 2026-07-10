@@ -1,8 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace Prism {
 
@@ -68,6 +70,17 @@ struct ASTNode {
   std::string referencedName;
   std::string usr;                // clang USR: stable identity across translation units
   std::string semanticParentUsr;  // USR of the semantic parent (empty at TU root)
+
+  // USRs of the declarations this node references, resolved by clang rather than
+  // by matching type spellings. A base specifier yields its base class; a field
+  // yields its type and, for containers, the types it is instantiated over, so
+  // `std::vector<GraphNode>` resolves to both std::vector and GraphNode. Empty
+  // when the parser could not resolve the type, or for hand-built nodes.
+  std::vector<std::string> referencedUsrs;
+
+  // McCabe cyclomatic complexity, set only on function *definitions* (a bare
+  // declaration has no body to measure). std::nullopt otherwise.
+  std::optional<int> cyclomaticComplexity;
 };
 
 }  // namespace Prism

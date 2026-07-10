@@ -362,12 +362,28 @@ private:
 
 **Implementation requirements:**
 
-`ComputeStructuralMetrics()` must compute for every node in the graph:
+`ComputeStructuralMetrics()` computes, **only for the node kinds the edge model actually reaches**
+— `File` (include edges), `Class` and `Struct` (inheritance and composition edges):
 - `dependencyCount` = number of outgoing edges from that node.
 - `dependentCount` = number of incoming edges to that node.
 - `instability` = dependencyCount / (dependencyCount + dependentCount). If both are 0, omit.
 - `couplingScore` = dependencyCount / total node count. Normalised 0–1.
 - `circularDependency` = whether the node participates in any cycle. Use DFS cycle detection.
+
+Only edges whose source *and* target are nodes in the graph are counted. An `#include <vector>`
+has no node to point at, so counting it as a dependency while `dependentCount`, `includeDepth` and
+`compileImpact` all ignore it would make `instability` a ratio of two different populations.
+
+Nodes of the remaining kinds — `Project`, `Module`, `Namespace`, `Function`, `Field`, `Include`,
+`ParentClass` — get none of these five. No `FunctionCall` or `SymbolUsage` edges are extracted yet,
+so a function's "zero dependencies" would describe what Prism does not look at rather than the
+code. Widen `ParticipatesInEdgeModel()` in `src/metrics-engine.cpp` when new edge kinds land.
+
+> **Open question.** `couplingScore`'s denominator is the *whole* node count, including `Field` and
+> `Include` nodes a file could never depend on — 121 of 196 nodes on Prism's own tree. The value is
+> normalised but not comparable across projects, and it is `dependencyCount` rescaled, which
+> `instability` already uses. Worth deciding whether the denominator should instead be the number of
+> nodes that participate in the edge model.
 
 `ComputeCodeMetrics()` must compute for every node where the source file is available:
 - `linesOfCode`: count lines in the source file for the range spanned by the node. This requires
@@ -376,12 +392,20 @@ private:
   Public/private distinction is not captured in the current `ASTNode` — omit `publicMethodCount`
   for now with a TODO.
 - `inheritanceDepth`: follow `Inheritance` edges upward and count depth.
+- `cyclomaticComplexity`: `1 + decision points`, where a decision point is `if`, `for`, range-`for`,
+  `while`, `do`, each `case` label, `catch`, `?:`, and each `&&` / `||`. `switch` itself is not one,
+  nor is `default`, nor `else`. Measured by the parser (the only stage holding a function body) and
+  carried onto the node by the graph builder. Set only on function *definitions*.
 
 `ComputeCppMetrics()` must compute for file nodes:
 - `includeDepth`: follow `IncludeDependency` edges recursively and find the maximum depth.
 - `transitiveIncludeCount`: count unique reachable file nodes via `IncludeDependency` edges.
 - `compileImpact`: count nodes that have a transitive incoming `IncludeDependency` path to this
   file. Expressed as a raw count (not a ratio).
+
+`includeDepth` and `inheritanceDepth` are both longest-path walks and **must be memoised**. Without
+a memo the cost is one visit per distinct *path*, and include graphs are diamonds, so it doubles
+with every level: forty-six headers arranged as a twenty-two level diamond took nine seconds.
 
 Metrics that cannot be computed must be left as `std::nullopt` — never set to 0 as a sentinel.
 
@@ -752,6 +776,9 @@ The following are noted in the design document but are explicitly out of scope f
 
 - Function call edge extraction (`FunctionCall`, `SymbolUsage` edge kinds) — stub these with TODO.
 - `publicMethodCount` — requires visibility tracking not yet present in `ASTNode`. Mark TODO.
+- `moduleBoundaryViolations` — this document names the field but never defines what counts as a
+  violation. Left as `std::nullopt` rather than inventing a rule the UI would present as fact.
+  Needs a definition before it can be implemented.
 - Template instantiation extraction — best-effort only, skip if complex.
 - Git history integration, incremental analysis, CI exit codes.
 - Multi-language support (TypeScript, Python, Rust).
