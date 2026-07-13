@@ -279,10 +279,14 @@ struct VisitContext {
   std::filesystem::path projectRoot;
   int* idCounter;
   bool includeExternal;
+  bool verbose;
   std::unordered_set<std::string>* seen;                     // dedup keys for USR-less nodes
   const std::unordered_set<std::string>* excluded;           // excluded directory names
   std::unordered_map<std::string, std::size_t>* usrToIndex;  // USR -> index in result->nodes
   std::unordered_set<std::string>* definedUsrs;              // USRs captured from a definition
+  // USRs of out-of-scope namespace/class/struct declarations captured purely to
+  // complete an in-scope member's logical parent chain -- see EnsureContainerNode.
+  std::unordered_set<std::string>* externalContainers;
 };
 
 /// Physical line count of a text file (number of lines, counting a final line
@@ -311,6 +315,83 @@ int CountFileLines(const std::string& path)
   return lines;
 }
 
+/// Ensures `containerCursor` (a Namespace/Class/Struct) has a corresponding
+/// ASTNode, synthesizing one -- and, recursively, its own out-of-scope
+/// ancestors -- when it doesn't. Called only with a specific in-scope
+/// declaration's *actual* semantic-parent chain (never a lexical walk), so it
+/// stays bounded to that lineage: resolving Logger::LogImpl's parent touches
+/// Logger and Firefly, never wanders into an unrelated header's namespace
+/// tree the way relaxing the scope filter itself would (that was tried and
+/// pulled in libc++'s entire internal namespace tree -- see git history).
+/// A no-op once the container is already present, whether captured normally
+/// (in scope) or synthesized here for a different member earlier.
+void EnsureContainerNode(CXCursor containerCursor, VisitContext* context)
+{
+  if (clang_Cursor_isNull(containerCursor)) {
+    return;
+  }
+  const CXCursorKind kind = clang_getCursorKind(containerCursor);
+  if (kind != CXCursor_Namespace && kind != CXCursor_ClassDecl && kind != CXCursor_StructDecl) {
+    return;
+  }
+
+  CXSourceLocation location = clang_getCursorLocation(containerCursor);
+  CXFile file;
+  unsigned line = 0;
+  unsigned column = 0;
+  unsigned offset = 0;
+  clang_getExpansionLocation(location, &file, &line, &column, &offset);
+  const std::string cursorFile = ToString(clang_getFileName(file));
+  if (cursorFile.empty()) {
+    return;
+  }
+
+  const std::string usr = CursorUsr(containerCursor, cursorFile);
+  if (usr.empty() || context->usrToIndex->count(usr) != 0) {
+    return;  // already captured (in scope or synthesized for an earlier member), or unnameable
+  }
+
+  // Ancestors must precede descendants in result->nodes: GraphBuilder resolves
+  // logicalParent in a single forward pass over the flat node list.
+  CXCursor parentCursor = clang_getCursorSemanticParent(containerCursor);
+  const bool hasParent =
+      !clang_Cursor_isNull(parentCursor) && clang_getCursorKind(parentCursor) != CXCursor_TranslationUnit;
+  if (hasParent) {
+    EnsureContainerNode(parentCursor, context);
+  }
+
+  ASTNode node;
+  node.id = (*context->idCounter)++;
+  node.kind = (kind == CXCursor_Namespace) ? NodeKind::Namespace
+              : (kind == CXCursor_ClassDecl) ? NodeKind::Class
+                                              : NodeKind::Struct;
+  node.name = ToString(clang_getCursorSpelling(containerCursor));
+  node.usr = usr;
+  // No project-relative path: this declaration isn't actually under --project,
+  // so it attaches directly to the project root physically rather than having
+  // GraphBuilder fabricate a fake file/module chain for it.
+  node.file = "";
+  node.line = static_cast<int>(line);
+  node.column = static_cast<int>(column);
+  node.lineEnd = node.line;
+  if (hasParent) {
+    node.logicalParent = ToString(clang_getCursorSpelling(parentCursor));
+    node.semanticParentUsr = CursorUsr(parentCursor, cursorFile);
+  }
+
+  if (context->externalContainers->insert(usr).second && context->verbose) {
+    LOG_INFO(
+        "Captured [{}] from outside --project ({}) to resolve an in-scope member's logical "
+        "parent",
+        node.name, cursorFile
+    );
+  }
+
+  const std::size_t index = context->result->nodes.size();
+  context->result->nodes.push_back(std::move(node));
+  context->usrToIndex->emplace(usr, index);
+}
+
 CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
 {
   auto* context = static_cast<VisitContext*>(data);
@@ -328,6 +409,11 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
   // external analysis was explicitly requested. This is what lets project
   // *headers* contribute declarations while excluding system and dependency
   // headers. Cursors with no file (compiler builtins) are always skipped.
+  // (A cursor's own semantic parent living out of scope -- e.g. a class
+  // declared in a header outside a --project scoped at a "src/" subtree --
+  // is handled separately below, by EnsureContainerNode; it deliberately
+  // does *not* widen this filter, or every out-of-scope #include, right down
+  // to libc++'s own internals, would get walked and captured too.)
   if (cursorFile.empty()) {
     return CXChildVisit_Continue;
   }
@@ -387,6 +473,12 @@ CXChildVisitResult Visitor(CXCursor cursor, CXCursor parent, CXClientData data)
     // Same file as this cursor: an anonymous namespace cannot span files, so the
     // salt CursorUsr() applies matches the one its members compute for it.
     node.semanticParentUsr = CursorUsr(logicalParentCursor, node.file);
+    // A no-op when the parent is already captured (the common case); otherwise
+    // it lies outside --project (e.g. this is an out-of-line definition of a
+    // class declared in a header --project doesn't cover) and needs synthesizing
+    // so GraphBuilder resolves the real parent instead of falling back to the
+    // project root.
+    EnsureContainerNode(logicalParentCursor, context);
   }
 
   // Referenced name for relationship-bearing kinds.
@@ -580,11 +672,26 @@ ParseResult Parser::Parse()
     databaseDir = config_.projectRoot;
   }
 
+  const std::filesystem::path databaseFile = databaseDir / "compile_commands.json";
+  std::error_code existsError;
+  if (!std::filesystem::exists(databaseFile, existsError)) {
+    LOG_ERROR(
+        "No compile_commands.json found at [{}]. Generate one with "
+        "`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` (or `bear -- <build command>` for "
+        "non-CMake builds), or pass --compile-commands to point at an existing one.",
+        databaseFile.string()
+    );
+    result.hadErrors = true;
+    return result;
+  }
+
   CXCompilationDatabase_Error databaseError = CXCompilationDatabase_NoError;
   CXCompilationDatabase database =
       clang_CompilationDatabase_fromDirectory(databaseDir.string().c_str(), &databaseError);
   if (databaseError != CXCompilationDatabase_NoError) {
-    LOG_ERROR("Failed to load compile_commands.json from [{}]", databaseDir.string());
+    LOG_ERROR(
+        "Found [{}] but failed to parse it — check that it is valid JSON.", databaseFile.string()
+    );
     result.hadErrors = true;
     return result;
   }
@@ -606,6 +713,14 @@ ParseResult Parser::Parse()
   std::unordered_set<std::string> seen;  // cross-TU dedup keys for USR-less nodes
   std::unordered_map<std::string, std::size_t> usrToIndex;
   std::unordered_set<std::string> definedUsrs;
+  std::unordered_set<std::string> externalContainers;  // see VisitContext::externalContainers
+
+  // Diagnostic counters: distinguish "nothing in scope" from "parsed but every
+  // TU failed" from "parsed fine but nothing was captured", so a bad --project,
+  // a stale compile-commands database, or an over-broad --exclude each surface
+  // their own actionable message instead of a silent empty graph.
+  unsigned inScopeCount = 0;
+  unsigned parsedOkCount = 0;
 
   for (unsigned commandIndex = 0; commandIndex < commandCount; ++commandIndex) {
     CXCompileCommand command = clang_CompileCommands_getCommand(commands, commandIndex);
@@ -624,6 +739,7 @@ ParseResult Parser::Parse()
     if (!config_.includeExternal && !ShouldAnalyse(sourceFile, config_.projectRoot, excluded)) {
       continue;
     }
+    ++inScopeCount;
 
     if (config_.verbose) {
       LOG_INFO("Parsing translation unit [{}]", sourceFile);
@@ -672,6 +788,7 @@ ParseResult Parser::Parse()
       LOG_WARNING("{}", warning);
       result.warnings.push_back(warning);
     }
+    ++parsedOkCount;
 
     CXCursor rootCursor = clang_getTranslationUnitCursor(unit);
     VisitContext context{
@@ -679,10 +796,12 @@ ParseResult Parser::Parse()
         config_.projectRoot,
         &idCounter,
         config_.includeExternal,
+        config_.verbose,
         &seen,
         &excluded,
         &usrToIndex,
-        &definedUsrs
+        &definedUsrs,
+        &externalContainers
     };
     clang_visitChildren(rootCursor, Visitor, &context);
 
@@ -692,6 +811,57 @@ ParseResult Parser::Parse()
   clang_CompileCommands_dispose(commands);
   clang_CompilationDatabase_dispose(database);
   clang_disposeIndex(index);
+
+  if (commandCount == 0) {
+    LOG_ERROR(
+        "Compile commands database at [{}] contains no translation units; nothing to analyse.",
+        databaseFile.string()
+    );
+    result.hadErrors = true;
+  }
+  else if (inScopeCount == 0) {
+    LOG_ERROR(
+        "None of the {} translation unit(s) in [{}] fall under --project [{}] (after "
+        "exclusions). This usually means the database was generated on a different machine or "
+        "in a container, so its paths don't match this checkout. Regenerate it locally (e.g. "
+        "`cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), point --compile-commands at a "
+        "fresh one, or pass --include-external to analyse it regardless of path.",
+        commandCount, databaseFile.string(), config_.projectRoot.string()
+    );
+    result.hadErrors = true;
+  }
+  else if (parsedOkCount == 0) {
+    LOG_ERROR(
+        "All {} in-scope translation unit(s) failed to parse; see the warning(s) above for the "
+        "specific failures.",
+        inScopeCount
+    );
+    result.hadErrors = true;
+  }
+  else if (result.nodes.empty()) {
+    LOG_WARNING(
+        "{} translation unit(s) parsed successfully but no declarations were captured within "
+        "scope; the resulting graph will be empty.",
+        parsedOkCount
+    );
+  }
+
+  if (!externalContainers.empty()) {
+    LOG_WARNING(
+        "{} declaration(s) outside --project were captured to complete the logical structure of "
+        "in-scope code (e.g. a class declared in a header outside --project, defined by an "
+        "in-scope .cpp) -- their own members are not analysed. Widen --project or pass "
+        "--include-external to include them fully; re-run with --verbose to see which ones.",
+        externalContainers.size()
+    );
+  }
+
+  if (config_.verbose) {
+    LOG_INFO(
+        "Compile database: {} total, {} in scope, {} parsed OK.", commandCount, inScopeCount,
+        parsedOkCount
+    );
+  }
 
   return result;
 }

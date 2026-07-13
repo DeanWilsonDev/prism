@@ -111,8 +111,8 @@ int main(int argc, char** argv)
     projectName = "Project";
   }
 
+  LOG_INFO("Prism {} analysing project [{}]", std::string(kPrismVersion), projectName);
   if (options.verbose) {
-    LOG_INFO("Prism {} analysing project [{}]", std::string(kPrismVersion), projectName);
     LOG_INFO("Project root: {}", options.projectRoot.string());
     LOG_INFO("Compile commands: {}", options.compileCommandsPath.string());
   }
@@ -126,33 +126,41 @@ int main(int argc, char** argv)
   parserConfig.excludedDirectories = options.excludes;
   parserConfig.useDefaultExcludes = options.useDefaultExcludes;
 
+  LOG_INFO("Stage 1/4: parsing sources...");
   Prism::Parser parser(parserConfig);
   Prism::ParseResult parseResult = parser.Parse();
   if (parseResult.hadErrors) {
-    LOG_ERROR("Parsing failed; aborting.");
+    LOG_ERROR("Parsing failed; aborting. Re-run with --verbose for per-file detail.");
     return 1;
   }
-  if (options.verbose) {
-    LOG_INFO(
-        "Parsed {} AST nodes ({} warnings)", parseResult.nodes.size(), parseResult.warnings.size()
+  LOG_INFO(
+      "Stage 1/4 complete: parsed {} AST node(s) ({} warning(s)).", parseResult.nodes.size(),
+      parseResult.warnings.size()
+  );
+
+  // Stage 2 — build the dependency graph.
+  LOG_INFO("Stage 2/4: building dependency graph...");
+  Prism::GraphBuilder builder(projectName);
+  Prism::DependencyGraph graph = builder.Build(parseResult.nodes, parseResult.fileLineCounts);
+  LOG_INFO(
+      "Stage 2/4 complete: built graph with {} node(s) and {} edge(s).", graph.nodes.size(),
+      graph.edges.size()
+  );
+  if (graph.nodes.size() <= 1) {
+    LOG_WARNING(
+        "The graph contains only the project root node — no source entities were captured. "
+        "Check --project, --compile-commands, and --exclude for a scoping mismatch."
     );
   }
 
-  // Stage 2 — build the dependency graph.
-  Prism::GraphBuilder builder(projectName);
-  Prism::DependencyGraph graph = builder.Build(parseResult.nodes, parseResult.fileLineCounts);
-  if (options.verbose) {
-    LOG_INFO("Built graph with {} nodes and {} edges", graph.nodes.size(), graph.edges.size());
-  }
-
   // Stage 3 — annotate metrics.
+  LOG_INFO("Stage 3/4: computing metrics...");
   Prism::MetricsEngine metrics;
   metrics.Annotate(graph);
-  if (options.verbose) {
-    LOG_INFO("Metrics annotation complete");
-  }
+  LOG_INFO("Stage 3/4 complete: metrics annotated.");
 
   // Stage 4 — export.
+  LOG_INFO("Stage 4/4: exporting analysis...");
   Prism::ExporterConfig exporterConfig;
   exporterConfig.outputPath = options.outputPath;
   exporterConfig.projectName = projectName;
@@ -160,12 +168,13 @@ int main(int argc, char** argv)
 
   Prism::Exporter exporter(exporterConfig);
   if (!exporter.Export(graph)) {
-    LOG_ERROR("Export failed.");
+    LOG_ERROR("Export failed; see the error above for the underlying cause.");
     return 1;
   }
 
-  if (options.verbose) {
-    LOG_INFO("Wrote analysis to {}", options.outputPath.string());
-  }
+  LOG_INFO(
+      "Stage 4/4 complete: wrote {} node(s) and {} edge(s) to {}", graph.nodes.size(),
+      graph.edges.size(), options.outputPath.string()
+  );
   return 0;
 }

@@ -1,0 +1,23 @@
+{
+  "metadata": {
+    "project": "src",
+    "generated_at": "2026-07-13T00:46:17Z",
+    "prism_version": "0.1.0",
+    "file_count": 0,
+    "node_count": 1,
+    "edge_count": 0
+  },
+  "nodes": [
+    {
+      "id": "src",
+      "name": "src",
+      "type": "Project",
+      "physical_parent": "",
+      "logical_parent": "",
+      "file": "",
+      "line": 0,
+      "column": 0
+    }
+  ],
+  "edges": []
+}
