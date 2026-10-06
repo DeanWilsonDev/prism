@@ -135,15 +135,16 @@ ______________________________________________________________________
 
 | Component | Technology |
 | --- | --- |
-| Language | C++20 |
-| Build system | CMake |
+| Language | C++26 |
+| Build system | CMake (3.30+) |
 | C++ parser | libclang |
 | Compilation database | compile_commands.json |
 | JSON serialisation | nlohmann/json |
 | Testing | Cimmerian |
 | Logging | Firefly |
 
-**Compiler requirements:** C++20 or later with `std::format` support — GCC 13+, Clang 16+, or MSVC 19.29+.
+**Compiler requirements:** C++26 — GCC 14+, Clang 18+, or a recent AppleClang. On Windows,
+clang-cl from Clang 18+; MSVC's cl.exe isn't supported. CMake 3.30+.
 
 **Target platforms:** Linux (primary), macOS, Windows (secondary).
 
