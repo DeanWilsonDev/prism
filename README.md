@@ -17,8 +17,9 @@ ______________________________________________________________________
 
 ### 1. Prerequisites
 
-- A C++20 toolchain (GCC 13+, Clang 16+, or MSVC 19.29+ — `std::format` is required).
-- CMake 3.20+.
+- A C++26 toolchain: GCC 14+, Clang 18+, or a recent AppleClang.
+- On Windows, clang-cl from Clang 18+; MSVC's cl.exe isn't supported.
+- CMake 3.30+.
 - **libclang** and its development headers / CMake package config. Prism parses
   code through libclang, so this must be present at build time (see
   [Building](#building)).
@@ -276,8 +277,8 @@ ______________________________________________________________________
 
 | Component | Technology |
 | --- | --- |
-| Language | C++20 |
-| Build system | CMake (3.20+) |
+| Language | C++26 |
+| Build system | CMake (3.30+) |
 | C++ parser | libclang (stable C API) |
 | Compilation database | compile_commands.json |
 | JSON serialisation | [Amanuensis](https://github.com/DeanWilsonDev/amanuensis) |
