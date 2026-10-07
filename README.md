@@ -17,8 +17,8 @@ ______________________________________________________________________
 
 ### 1. Prerequisites
 
-- A C++26 toolchain: GCC 14+, Clang 18+, or a recent AppleClang.
-- On Windows, clang-cl from Clang 18+; MSVC's cl.exe isn't supported.
+- A C++26 toolchain: GCC 14+, Clang 19+, or a recent AppleClang.
+- On Windows, clang-cl from Clang 19+; MSVC's cl.exe isn't supported.
 - CMake 3.30+.
 - **libclang** and its development headers / CMake package config. Prism parses
   code through libclang, so this must be present at build time (see
