@@ -13,7 +13,8 @@ namespace Prism {
 
 namespace {
 
-using Amanuensis::Value;
+using Amanuensis::Json;
+using Amanuensis::JsonValue;
 
 /// Current UTC time as an ISO 8601 string. Built from std::chrono + std::format
 /// on the calendar fields, avoiding reliance on chrono format specifiers that
@@ -40,35 +41,35 @@ std::string CurrentTimestamp()
 }
 
 template <typename T>
-void AddIfPresent(Value& object, const char* key, const std::optional<T>& value)
+void AddIfPresent(JsonValue& object, const char* key, const std::optional<T>& value)
 {
   if (!value.has_value()) {
     return;
   }
   if constexpr (std::is_same_v<T, bool>) {
-    object.Insert(key, Value(value.value()));
+    Json::Insert(object, key, ToJsonValue(value.value()));
   }
   else if constexpr (std::is_floating_point_v<T>) {
-    object.Insert(key, Value(static_cast<double>(value.value())));
+    Json::Insert(object, key, ToJsonValue(static_cast<double>(value.value())));
   }
   else {
-    object.Insert(key, Value(static_cast<int>(value.value())));
+    Json::Insert(object, key, ToJsonValue(static_cast<int>(value.value())));
   }
 }
 
-Value SerialiseNode(const GraphNode& node)
+JsonValue SerialiseNode(const GraphNode& node)
 {
-  Value object = Value::MakeObject();
-  object.Insert("id", Value(node.id));
-  object.Insert("name", Value(node.name));
-  object.Insert("type", NodeKindToValue(node.kind));
-  object.Insert("physical_parent", Value(node.physicalParent));
-  object.Insert("logical_parent", Value(node.logicalParent));
-  object.Insert("file", Value(node.file));
-  object.Insert("line", Value(node.line));
-  object.Insert("column", Value(node.column));
+  JsonValue object = Json::MakeObject();
+  Json::Insert(object, "id", ToJsonValue(node.id));
+  Json::Insert(object, "name", ToJsonValue(node.name));
+  Json::Insert(object, "type", NodeKindToValue(node.kind));
+  Json::Insert(object, "physical_parent", ToJsonValue(node.physicalParent));
+  Json::Insert(object, "logical_parent", ToJsonValue(node.logicalParent));
+  Json::Insert(object, "file", ToJsonValue(node.file));
+  Json::Insert(object, "line", ToJsonValue(node.line));
+  Json::Insert(object, "column", ToJsonValue(node.column));
   if (!node.referencedName.empty()) {
-    object.Insert("referenced_name", Value(node.referencedName));
+    Json::Insert(object, "referenced_name", ToJsonValue(node.referencedName));
   }
 
   AddIfPresent(object, "lines_of_code", node.linesOfCode);
@@ -89,13 +90,13 @@ Value SerialiseNode(const GraphNode& node)
   return object;
 }
 
-Value SerialiseEdge(const Edge& edge)
+JsonValue SerialiseEdge(const Edge& edge)
 {
-  Value object = Value::MakeObject();
-  object.Insert("source", Value(edge.sourceId));
-  object.Insert("target", Value(edge.targetId));
-  object.Insert("type", Value(std::string(ToStringFromEdgeKind(edge.kind))));
-  object.Insert("weight", Value(edge.weight));
+  JsonValue object = Json::MakeObject();
+  Json::Insert(object, "source", ToJsonValue(edge.sourceId));
+  Json::Insert(object, "target", ToJsonValue(edge.targetId));
+  Json::Insert(object, "type", ToJsonValue(std::string(ToStringFromEdgeKind(edge.kind))));
+  Json::Insert(object, "weight", ToJsonValue(edge.weight));
   return object;
 }
 
@@ -112,28 +113,28 @@ bool Exporter::Export(const DependencyGraph& graph)
     }
   }
 
-  Value metadata = Value::MakeObject();
-  metadata.Insert("project", Value(config_.projectName));
-  metadata.Insert("generated_at", Value(CurrentTimestamp()));
-  metadata.Insert("prism_version", Value(config_.prismVersion));
-  metadata.Insert("file_count", Value(fileCount));
-  metadata.Insert("node_count", Value(static_cast<int>(graph.nodes.size())));
-  metadata.Insert("edge_count", Value(static_cast<int>(graph.edges.size())));
+  JsonValue metadata = Json::MakeObject();
+  Json::Insert(metadata, "project", ToJsonValue(config_.projectName));
+  Json::Insert(metadata, "generated_at", ToJsonValue(CurrentTimestamp()));
+  Json::Insert(metadata, "prism_version", ToJsonValue(config_.prismVersion));
+  Json::Insert(metadata, "file_count", ToJsonValue(fileCount));
+  Json::Insert(metadata, "node_count", ToJsonValue(static_cast<int>(graph.nodes.size())));
+  Json::Insert(metadata, "edge_count", ToJsonValue(static_cast<int>(graph.edges.size())));
 
-  Value nodes = Value::MakeArray();
+  JsonValue nodes = Json::MakeArray();
   for (const GraphNode& node : graph.nodes) {
-    nodes.PushBack(SerialiseNode(node));
+    Json::PushBack(nodes, SerialiseNode(node));
   }
 
-  Value edges = Value::MakeArray();
+  JsonValue edges = Json::MakeArray();
   for (const Edge& edge : graph.edges) {
-    edges.PushBack(SerialiseEdge(edge));
+    Json::PushBack(edges, SerialiseEdge(edge));
   }
 
-  Value document = Value::MakeObject();
-  document.Insert("metadata", std::move(metadata));
-  document.Insert("nodes", std::move(nodes));
-  document.Insert("edges", std::move(edges));
+  JsonValue document = Json::MakeObject();
+  Json::Insert(document, "metadata", std::move(metadata));
+  Json::Insert(document, "nodes", std::move(nodes));
+  Json::Insert(document, "edges", std::move(edges));
 
   // WriterOptions default to pretty printing with a two-space indent and a
   // trailing newline, matching Prism's previous output shape.
